@@ -91,6 +91,8 @@ const THEMES = {
 };
 const applyThemeToT = (id) => { const p = THEMES[id] || THEMES.default; Object.keys(p).forEach((k) => { if (k !== "group" && k !== "name") T[k] = p[k]; }); };
 const PROVIDERS = ["Etisalat", "DU"];
+// Bump this whenever the bill parser improves — older bills auto-upgrade on load (see App).
+const PARSER_VERSION = 10;
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const USAGE_CATS = ["Local calls & SMS", "Staff chargeable"];
 
@@ -124,6 +126,8 @@ const ICONS = {
   folder: '<path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2v1"/><path d="M2 13h20l-2 7H4z"/>',
   save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
   dot: '<circle cx="12" cy="12" r="3"/>',
+  lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  unlock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.9-1"/>',
   history: '<path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/>',
   receipt: '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1Z"/><path d="M8 7h8"/><path d="M8 11h8"/><path d="M8 15h5"/>',
   review: '<path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="m9 14 2 2 4-4"/>',
@@ -144,7 +148,7 @@ const LayoutDashboard = mk_("dashboard"), Network = mk_("network"), Upload = mk_
   Loader2 = mk_("loader"), AlertCircle = mk_("alert"), Building2 = mk_("building"),
   CalendarDays = mk_("calendar"), Sparkles = mk_("sparkles"), Search = mk_("search"),
   ArrowUpRight = mk_("arrowur"), ArrowDownRight = mk_("arrowdr"), Minus = mk_("minus"),
-  FolderOpen = mk_("folder"), Save = mk_("save"), History = mk_("history"), Receipt = mk_("receipt"), Review = mk_("review"), Eye = mk_("eye"), Palette = mk_("palette");
+  FolderOpen = mk_("folder"), Save = mk_("save"), History = mk_("history"), Receipt = mk_("receipt"), Review = mk_("review"), Eye = mk_("eye"), Palette = mk_("palette"), Lock = mk_("lock"), Unlock = mk_("unlock");
 
 /* ============================== STORAGE (localStorage) ============================== */
 const K = { conn: "tem:connections", bills: "tem:bills", settings: "tem:settings" };
@@ -273,39 +277,43 @@ function connTotals(c) {
   return { base, elig, sub, vat, total: sub + vat };
 }
 function allocate(bill, connections, settings) {
-  const conn = connections.find(
-    (c) => normAcc(c.accountNumber) && normAcc(c.accountNumber) === normAcc(bill.accountNumber)
-  );
-  const vatRate = num(settings.vatRate);
-  const eu = bill.extraUsages || [];
-  const localSms = eu.filter((u) => u.category === "Local calls & SMS").reduce((s, u) => s + num(u.amount), 0);
-  const staff = eu.filter((u) => u.category === "Staff chargeable").reduce((s, u) => s + num(u.amount), 0);
-  const staffLines = eu.filter((u) => u.category === "Staff chargeable");
-  const basicRental = num(bill.basicRental);
-  const otherCredits = num(bill.otherCredits);
-  let vat = bill.vat !== undefined && bill.vat !== "" ? num(bill.vat) : null;
-  let total, localSmsUse, staffUse;
-  if (bill.provider === "DU") {
-    localSmsUse = 0; staffUse = 0;
-    const sub = basicRental + otherCredits;
-    const billTotal = num(bill.total);
-    if (vat === null) vat = billTotal > sub ? +(billTotal - sub).toFixed(2) : +(sub * (vatRate / 100)).toFixed(2);
-    total = billTotal || +(sub + vat).toFixed(2);
-  } else {
-    localSmsUse = localSms; staffUse = staff;
-    const sub = basicRental + localSms + staff + otherCredits;
-    const billTotal = num(bill.total);
-    if (vat === null) vat = billTotal > sub ? +(billTotal - sub).toFixed(2) : +(sub * (vatRate / 100)).toFixed(2);
-    total = billTotal || +(sub + vat).toFixed(2);
+  // For any auto-parsed bill (not hand-edited & saved in the modal), re-read its figures FRESH from
+  // the stored bill text every time — never trust possibly-stale stored numbers for the display.
+  let b = bill;
+  if (bill.rawText && (bill.billVersion || 0) < PARSER_VERSION) {
+    try {
+      const p = heuristicParse(bill.rawText, bill.provider);
+      b = { ...bill };
+      ["basicRental", "otherCharges", "vat", "total", "currentCharges", "previousBalance", "paymentReceived", "billDate", "dueDate"].forEach((k) => { if (p[k] !== undefined && p[k] !== "") b[k] = p[k]; });
+    } catch (e) { /* keep original figures on any parse issue */ }
   }
+  const conn = connections.find(
+    (c) => normAcc(c.accountNumber) && normAcc(c.accountNumber) === normAcc(b.accountNumber)
+  );
+  const eu = b.extraUsages || [];
+  const localSms = +eu.filter((u) => u.category === "Local calls & SMS").reduce((s, u) => s + num(u.amount), 0).toFixed(2);
+  const staff = +eu.filter((u) => u.category === "Staff chargeable").reduce((s, u) => s + num(u.amount), 0).toFixed(2);
+  const staffLines = eu.filter((u) => u.category === "Staff chargeable");
+  const basicRental = num(b.basicRental);
+  // "Other" = current-month non-rental charges. Use the itemised Local/Staff sum if present, else the aggregate.
+  const euSum = +(localSms + staff).toFixed(2);
+  const other = euSum > 0 ? euSum : num(b.otherCharges);
+  // VAT and Total are READ straight off the bill (b is re-parsed fresh from the stored text above).
+  const vat = num(b.vat);
+  const total = num(b.total) || +(basicRental + other + vat).toFixed(2);
+  const localSmsUse = b.provider === "DU" ? 0 : localSms;
+  const staffUse = b.provider === "DU" ? 0 : staff;
   return {
-    conn, accountNumber: bill.accountNumber || conn?.accountNumber || "",
-    user: conn?.userName || bill.user || "—", company: conn?.company || bill.company || "—",
-    department: conn?.department || "—", provider: bill.provider, month: bill.monthKey,
-    invoiceNumber: bill.invoiceNumber || "", invoicePeriod: bill.invoicePeriod || "",
-    basicRental, localSms: localSmsUse, staff: staffUse, staffLines, otherCredits, vat, total,
-    approved: !!bill.approved, approvedAt: bill.approvedAt || null,
-    companyCost: total - staffUse,
+    conn, accountNumber: b.accountNumber || conn?.accountNumber || "",
+    user: conn?.userName || b.user || "—", company: conn?.company || b.company || "—",
+    department: conn?.department || "—", provider: b.provider, month: b.monthKey,
+    invoiceNumber: b.invoiceNumber || "", invoicePeriod: b.invoicePeriod || "",
+    basicRental, other, localSms: localSmsUse, staff: staffUse, staffLines, otherCredits: num(b.otherCredits), vat, total,
+    approved: !!b.approved, approvedAt: b.approvedAt || null,
+    previousBalance: num(b.previousBalance), paymentReceived: num(b.paymentReceived), dueDate: b.dueDate || "",
+    prevPending: b.prevPending != null ? num(b.prevPending) : (b.provider === "Etisalat" ? +Math.max(0, num(b.previousBalance) - num(b.paymentReceived)).toFixed(2) : num(b.previousBalance)),
+    amountDue: b.amountDue != null && b.amountDue !== "" ? num(b.amountDue) : total,
+    companyCost: +(total - staffUse).toFixed(2),
   };
 }
 
@@ -325,18 +333,22 @@ function extractionInstruction(provider) {
   const common = `Read this ENTIRE telecom invoice very carefully, including all pages and the totals/summary section. Extract the EXACT printed figures. Return ONLY strict minified JSON — no markdown fences, no commentary. All amounts must be plain numbers (no currency symbols, no thousands separators). For "accountNumber" return it exactly as printed on the invoice (keep any dots or dashes).`;
   if (provider === "Etisalat") {
     return common + ` This is an Etisalat (e&) tax invoice. JSON shape:
-{"accountNumber":"","invoiceNumber":"","invoicePeriod":"","basicRental":0,"vat":0,"total":0,"otherCredits":0,"extraUsages":[{"description":"","amount":0,"category":"Local calls & SMS"|"Staff chargeable"}]}
-Definitions: basicRental = the recurring monthly plan/package/rental charge (the "Service Rental" / plan fee). vat = the total VAT/tax amount. total = the grand total / total amount due including VAT. otherCredits = credits or discounts (0 if none). extraUsages = every line under "Usage charges", "One-time charges", "Other charges", subscriptions, add-ons, etc. Classify each: LOCAL voice calls (calls to mobile / to telephone within UAE) and LOCAL SMS → category "Local calls & SMS" (these fold back into the company rental). EVERYTHING ELSE — international/roaming calls, international SMS, premium/content/subscription services, parking, VAS, add-ons, one-time fees, device charges — → category "Staff chargeable" (recovered from the staff), and give each a clear description (e.g. "International calls", "Parking subscription", "Content subscription"). If a usage section shows 0.00, omit it. Ensure basicRental + sum(extraUsages) + otherCredits + vat ≈ total.`;
+{"accountNumber":"","invoiceNumber":"","invoicePeriod":"","billDate":"","dueDate":"","planName":"","previousBalance":0,"paymentReceived":0,"currentCharges":0,"basicRental":0,"vat":0,"total":0,"otherCredits":0,"extraUsages":[{"description":"","amount":0,"category":"Local calls & SMS"|"Staff chargeable"}]}
+Definitions: billDate = the invoice/bill issue date, often labelled "Tax Point Date" (e.g. "28 Feb 2026"). dueDate = the payment due date (e.g. "20 Feb 2026"). planName = the plan/package/tariff name if shown (e.g. "Business Super 150"). invoicePeriod = the BILL PERIOD date range shown near the TOP of the invoice (labelled "Bill period" / "Billing period" / "Bill cycle"), e.g. "01 Jan 2026 - 31 Jan 2026". Return ONLY the clean date range (two dates) — do NOT include any other words such as "on time", "refund", "other charges", labels, or amounts. previousBalance = the amount carried in from last month, labelled "Previous month bill" / "Previous balance" / "Balance brought forward" (0 if none). paymentReceived = the "Payments received" amount already paid against the previous balance — it is printed as a NEGATIVE deduction (e.g. −79.60); return the positive magnitude (0 if none). currentCharges = "Current month charges (including VAT)" — this month's total charges (0 if not shown). basicRental = the recurring monthly plan/package/rental charge (labelled "Service Rentals" / "Service Rental" / plan fee). vat = the total VAT/tax amount ("VAT on taxable services"). total = the CURRENT-MONTH charge including VAT — the figure labelled "Current month charges (including VAT)" (read BOTH the large and small digits, e.g. "220" and ".55" mean 220.55). Do NOT add the previous balance into total; keep previousBalance separate. otherCredits = credits or discounts (0 if none). extraUsages = every line under "Usage charges", "One-time charges", "Other charges", subscriptions, add-ons, etc. Classify each: LOCAL voice calls (calls to mobile / to telephone within UAE) and LOCAL SMS → category "Local calls & SMS" (these fold back into the company rental). EVERYTHING ELSE — international/roaming calls, international SMS, premium/content/subscription services, parking, VAS, add-ons, one-time fees, device charges — → category "Staff chargeable" (recovered from the staff), and give each a clear description (e.g. "International calls", "Parking subscription", "Content subscription"). If a usage section shows 0.00, omit it. Ensure basicRental + sum(extraUsages) + otherCredits + vat ≈ total.`;
   }
   return common + ` This is a DU (Emirates Integrated Telecommunications) tax invoice. JSON shape:
-{"accountNumber":"","invoiceNumber":"","invoicePeriod":"","basicRental":0,"vat":0,"total":0}
+{"accountNumber":"","invoiceNumber":"","invoicePeriod":"","billDate":"","dueDate":"","planName":"","previousBalance":0,"paymentReceived":0,"currentCharges":0,"basicRental":0,"vat":0,"total":0}
 CRITICAL field mapping for DU:
+- billDate = the "Bill date" / invoice date. dueDate = the "Due date" or "Due by" date (e.g. "31st Mar 2026"). planName = the plan/package name if shown.
 - accountNumber = the "Service ID" — the mobile number shown in the "Charges summary by services" / service details (e.g. 0582192470, a 10-digit number starting with 05). Use the Service ID, NOT "Your account number" and NOT the bill number. If several service lines exist, use the first Service ID.
 - invoiceNumber = the value labelled "Your bill number" (e.g. 0187857964).
 - invoicePeriod = the "Your bill cycle" range (e.g. 1st May - 31st May 2026).
-- basicRental = "Subtotal of taxable services" (the total charges BEFORE VAT).
+- previousBalance = the previous outstanding, labelled "Previous bill amount" / "Previous bill charges" / the previous "Total amount due" (0 if none).
+- paymentReceived = "Payment received" / "What you paid" against the previous bill — may be printed negative; return the positive magnitude (0 if none).
+- currentCharges = "This month's charges" total (0 if not shown).
+- basicRental = "Subtotal of taxable services" / "Taxable services" (the total charges BEFORE VAT — do NOT confuse with "Non-taxable services").
 - vat = the "VAT at 5%" / "VAT (5%)" amount.
-- total = "Total amount due" (including VAT). The relationship basicRental + vat = total must hold.`;
+- total = THIS MONTH's charges including VAT = Taxable services + VAT (e.g. 2669.64 + 133.48 = 2803.12). Do NOT use the grand "Total amount due" that adds the previous balance; keep previousBalance separate.`;
 }
 let SB = null; // Supabase client, set once available (used by storage helpers)
 async function fileToBase64(blob) { return await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob); }); }
@@ -451,22 +463,116 @@ function parseDU(text) {
   if (!out.accountNumber) { const a = t.match(/account number\D{0,40}?([0-9][0-9.\-]{2,12})/i); if (a) out.accountNumber = a[1]; }
   if (!out.accountNumber) { const d = t.match(/\b(\d{1,3}\.\d{4,8})\b/); if (d) out.accountNumber = d[1]; }
   const p = t.match(/bill cycle\s+([0-9][A-Za-z0-9 \-']*?\d{4})/i); if (p) out.invoicePeriod = p[1].trim();
+  if (!out.invoicePeriod) out.invoicePeriod = extractPeriod(t);
   out.total = amt(/total amount due\D{0,12}(\d[\d,]*\.\d{2})/i);
-  out.basicRental = amt(/subtotal of taxable services\D{0,12}(\d[\d,]*\.\d{2})/i);
-  if (out.basicRental === "") out.basicRental = amt(/taxable services\D{0,12}(\d[\d,]*\.\d{2})/i);
-  out.vat = amt(/vat at 5%\D{0,12}(\d[\d,]*\.\d{2})/i);
-  if (out.vat === "") out.vat = amt(/vat\s*\(5%\)\D{0,12}(\d[\d,]*\.\d{2})/i);
-  // if VAT looks wrong but total & rental are known, let allocate derive it
-  if (out.vat !== "" && out.basicRental !== "" && out.total !== "" && Math.abs((out.basicRental + out.vat) - out.total) > 0.05) out.vat = "";
+  // In pdf.js text the DU breakdown row lists every column (Monthly, National, …) then the SUBTOTAL
+  // last. So take the LAST figure in the "Subtotal of taxable/non-taxable services" row.
+  const lastNum = (label) => { const m = t.match(new RegExp(label + "((?:\\s+-?[\\d,]+\\.\\d{2})+)", "i")); if (!m) return ""; const nums = m[1].trim().split(/\s+/); const v = parseFloat(nums[nums.length - 1].replace(/,/g, "")); return isNaN(v) ? "" : v; };
+  out.basicRental = lastNum("subtotal of taxable services");
+  if (out.basicRental === "") out.basicRental = amt(/subtotal of taxable services\D{0,12}(\d[\d,]*\.\d{2})/i);
+  out.otherCharges = lastNum("subtotal of non-taxable services");
+  // real-label extraction of dates, previous pending, payments (fills only blanks)
+  const ex = extractBillExtras(text, "DU");
+  fillBlanks(out, ex);
+  if ((out.otherCharges === "" || out.otherCharges == null) && ex.otherCharges !== "") out.otherCharges = ex.otherCharges;
+  // DU VAT = 5% of the TAXABLE services only (non-taxable carries no VAT). This equals the printed VAT.
+  out.vat = +(num(out.basicRental) * 5 / 100).toFixed(2);
+  out.total = +(num(out.basicRental) + num(out.otherCharges) + num(out.vat)).toFixed(2);
+  out.currentCharges = out.total;
   return out;
+}
+// Robust bill-period extractor: finds a real date RANGE (e.g. "01 Jan 2026 - 31 Jan 2026"),
+// preferring one near a period label, ignoring stray words like "on time / refund / other".
+const DATE_RANGE_RE = /(\d{1,2}(?:st|nd|rd|th)?[\s\-\/.]+(?:\d{1,2}|[A-Za-z]{3,9})(?:[\s\-\/.]+\d{2,4})?)\s*(?:-|–|—|to|till|until|thru)\s*(\d{1,2}(?:st|nd|rd|th)?[\s\-\/.]+(?:\d{1,2}|[A-Za-z]{3,9})[\s\-\/.]+\d{2,4})/i;
+function extractPeriod(t) {
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  // 1) look right after a period-type label (bill period / billing period / bill cycle / invoice period / statement period)
+  const near = t.match(/(?:bill(?:ing)?\s*(?:period|cycle)|invoice\s*period|statement\s*period|billing\s*month|period)\s*:?\s*([^\n]{0,70})/i);
+  if (near) { const r = near[1].match(DATE_RANGE_RE); if (r) return clean(r[1] + " - " + r[2]); }
+  // 2) otherwise take the first real date range near the top of the invoice
+  const top = t.slice(0, 2200);
+  let r2 = top.match(DATE_RANGE_RE); if (r2) return clean(r2[1] + " - " + r2[2]);
+  // 3) anywhere in the document
+  let r3 = t.match(DATE_RANGE_RE); if (r3) return clean(r3[1] + " - " + r3[2]);
+  return "";
+}
+// A stored invoicePeriod is "valid" only if it looks like a real date/period (has a year, a month name, or a d/m date) — filters out old garbage like "One-time"/"Other".
+function validPeriod(p) {
+  if (!p) return false;
+  return /\d{4}/.test(p) || /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(p) || /\d{1,2}\s*[\/\-.]\s*\d{1,2}/.test(p);
+}
+// Best period to display for a bill: use a valid stored period, else re-derive from stored rawText (no API needed), else the folder month.
+function billPeriod(b) {
+  if (validPeriod(b.invoicePeriod)) return b.invoicePeriod;
+  if (b.rawText) { const p = extractPeriod(b.rawText); if (p) return p; }
+  return "";
+}
+// Extracts the "extra" bill fields (dates, previous balance, payments, current charges)
+// using the ACTUAL labels printed on real DU and Etisalat invoices. Handles thousands
+// separators (6,279.00), unicode minus (−79.60), and split decimals ("52 .50").
+function extractBillExtras(text, provider) {
+  let t = (text || "").replace(/\s+/g, " ").replace(/\u2212/g, "-");
+  const out = { billDate: "", dueDate: "", previousBalance: "", paymentReceived: "", currentCharges: "", vat: "", otherCharges: "" };
+  if (!t) return out;
+  // money-like number: must carry 2 decimals — avoids catching ordinals like "1st" as the number 1
+  const NUM = "(-?\\d[\\d,]*\\s?\\.\\s?\\d{2})";
+  const toNum = (s) => { const v = parseFloat(String(s).replace(/[,\s]/g, "")); return isNaN(v) ? "" : v; };
+  const near = (labels, gap = 45) => {
+    for (const l of labels) {
+      // .{0,gap}? lets a date/label sit between the caption and its amount (NUM needs 2 decimals,
+      // so "28 Feb 2026" is skipped and the real money figure is picked up).
+      const m = t.match(new RegExp(l + ".{0," + gap + "}?" + NUM, "i"));
+      if (m) return toNum(m[1]);
+    }
+    return "";
+  };
+  const dateNear = (labels, gap = 24) => {
+    const D = "(\\d{1,2}(?:st|nd|rd|th)?\\s+[A-Za-z]{3,9}\\s+\\d{2,4}|\\d{1,2}[\\/\\-.]\\d{1,2}[\\/\\-.]\\d{2,4})";
+    for (const l of labels) {
+      const m = t.match(new RegExp(l + "[^0-9]{0," + gap + "}" + D, "i"));
+      if (m) return m[1].replace(/\s+/g, " ").trim();
+    }
+    return "";
+  };
+  if (provider === "DU") {
+    out.dueDate = dateNear(["due by", "payment due date", "due date"]);
+    out.billDate = dateNear(["bill date", "bill issue date", "invoice date"]);
+    out.vat = near(["vat at 5%", "vat \\(5%\\)", "vat\\(5%\\)", "vat 5%"]);
+    // previous pending: "Minimum payment to stay connected" is the cleanest single figure
+    out.previousBalance = near(["minimum payment to stay connected", "total remaining", "previous bill amount", "previous balance"]);
+    // In pdf.js the row prints as: "Total amount due  What you paid  Adjustments   <prev>  <paid>  <adj>".
+    // So "What you paid" is the 2nd value — read it positionally, not by nearest number (which grabs <prev>).
+    { const pm = t.match(/total amount due\s+what you paid\s+adjustments\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})/i);
+      out.paymentReceived = pm ? Math.abs(toNum(pm[2])) : near(["what you paid", "payment received"]); }
+    out.currentCharges = near(["this month.?s charges aed"]); // usually computed later as taxable + vat
+    out.otherCharges = near(["subtotal of non-taxable services", "non-taxable services"]); // usually 0
+  } else {
+    out.billDate = dateNear(["tax point date", "bill issue date", "bill date", "invoice date"]);
+    out.dueDate = dateNear(["pay before", "payment due date", "due by", "due date"]);
+    out.vat = near(["vat on taxable services", "vat at 5%", "vat \\(5%\\)", "vat 5%"]);
+    out.previousBalance = near(["previous month bill", "previous balance", "balance brought forward"]);
+    out.paymentReceived = near(["payments received", "payment received", "amount received"]);
+    out.currentCharges = near(["current month charges \\(including vat\\)", "current month charges", "current charges"]);
+    // "Other" = everything charged this month that isn't the plan rental (Usage, One-Time, Other Credits & Charges)
+    const usage = num(near(["usage charges"])), oneTime = num(near(["one-time charges", "one time charges"])), occ = num(near(["other credits & charges", "other credits and charges"]));
+    if (usage || oneTime || occ) out.otherCharges = +(usage + oneTime + occ).toFixed(2);
+  }
+  // payments are printed as a negative deduction — store the magnitude
+  if (out.paymentReceived !== "" && out.paymentReceived < 0) out.paymentReceived = Math.abs(out.paymentReceived);
+  return out;
+}
+// copy src → dst only where dst is still blank (never clobber a value the parser already found)
+function fillBlanks(dst, src) {
+  for (const k in src) { const v = src[k]; if (v !== "" && v != null && (dst[k] === "" || dst[k] == null)) dst[k] = v; }
+  return dst;
 }
 function heuristicParse(text, provider) {
   if (provider === "DU") return parseDU(text);
   const t = (text || "").replace(/\s+/g, " ");
   const amt = (labels) => {
     for (const l of labels) {
-      const m = t.match(new RegExp(l + "[^0-9\\-]{0,18}(-?[0-9][0-9,]*\\.?[0-9]{0,2})", "i"));
-      if (m) return parseFloat(m[1].replace(/,/g, ""));
+      const m = t.match(new RegExp(l + "[^0-9\\-]{0,18}(-?[0-9][0-9,]*(?:\\s?\\.\\s?[0-9]{1,2})?)", "i"));
+      if (m) return parseFloat(m[1].replace(/[,\s]/g, ""));
     }
     return "";
   };
@@ -487,14 +593,31 @@ function heuristicParse(text, provider) {
   const out = {
     accountNumber: numStr(["account number", "account no", "account #", "a\\/c no", "account"]),
     invoiceNumber: str(["tax invoice number", "invoice number", "invoice no", "bill number", "invoice #"]),
-    invoicePeriod: str(["billing period", "bill period", "invoice period"]),
-    basicRental: amt(["monthly charges", "recurring charges", "subscription", "plan charges", "monthly rental", "current charges", "charges before vat", "sub total", "subtotal", "rental"]),
-    vat: amt(["vat amount", "vat \\(5%\\)", "vat 5%", "value added tax", "tax amount", "vat"]),
+    invoicePeriod: extractPeriod(t) || str(["billing period", "bill period", "invoice period"]),
+    basicRental: amt(["service rentals", "monthly charges", "recurring charges", "subscription", "plan charges", "monthly rental", "charges before vat", "sub total", "subtotal", "rental"]),
+    vat: amt(["vat on taxable services", "vat amount", "vat \\(5%\\)", "vat 5%", "value added tax", "tax amount", "vat"]),
     total: amt(["total amount due", "amount due", "grand total", "total payable", "total amount payable", "amount payable", "invoice total", "total amount"]),
   };
-  // drop implausible VAT so allocate can derive it from the total (VAT should not equal the rental or exceed the total)
-  if (out.vat !== "" && out.basicRental !== "" && Math.abs(out.vat - out.basicRental) < 0.01) out.vat = "";
-  if (out.vat !== "" && out.total !== "" && out.vat >= out.total) out.vat = "";
+  // real-label extraction — reads dates, previous pending, payments, VAT, other, current total
+  const ex = extractBillExtras(text, "Etisalat");
+  fillBlanks(out, ex);
+  if (ex.otherCharges !== "") out.otherCharges = ex.otherCharges;
+  // VAT is READ off the bill ("VAT on taxable services"). If it doesn't reconcile with the printed
+  // total & (rental+other), take the bill's own VAT = printed total − rental − other. Compute only as a last resort.
+  { const parts = +(num(out.basicRental) + num(out.otherCharges)).toFixed(2); const printed = num(ex.currentCharges); let v = num(ex.vat);
+    if (printed && (!v || Math.abs(parts + v - printed) > 0.5)) v = +(printed - parts).toFixed(2);
+    if (!v) v = +(parts * 5 / 100).toFixed(2);
+    out.vat = v; out.total = printed || +(parts + v).toFixed(2); out.currentCharges = out.total; }
+  // Split the Usage into local (national — stays with the company) vs international/roaming
+  // (staff-chargeable), so those bills get flagged and staff recovery shows in reports.
+  { const readAmt = (labels, gap = 45) => { for (const l of labels) { const mm = t.match(new RegExp(l + ".{0," + gap + "}?(-?\\d[\\d,]*\\s?\\.\\s?\\d{2})", "i")); if (mm) return parseFloat(mm[1].replace(/[,\s]/g, "")); } return 0; };
+    const staffUse = +(readAmt(["international calls and usages"]) + readAmt(["roaming calls and usages"]) + readAmt(["roaming data usages", "roaming data and usages"])).toFixed(2);
+    if (staffUse > 0.001 && num(out.otherCharges) >= staffUse - 0.01) {
+      const local = +(num(out.otherCharges) - staffUse).toFixed(2); const eu = [];
+      if (local > 0.001) eu.push({ description: "National calls & local usage", amount: local, category: "Local calls & SMS" });
+      eu.push({ description: "International / roaming usage", amount: staffUse, category: "Staff chargeable" });
+      out.extraUsages = eu;
+    } }
   return out;
 }
 /* Many operator files are named <account>_<invoice>.pdf — use that as a reliable source */
@@ -828,6 +951,32 @@ function App({ supabase, session, onLogout }) {
     return () => { if (channel) supabase.removeChannel(channel); };
   }, []);
 
+  // Auto-upgrade: when the parser improves, silently re-parse older bills from their stored
+  // text so every screen and report is correct — no button to press, nothing for the user to miss.
+  useEffect(() => {
+    if (!loaded || !bills.length) return;
+    const rate = num(settings.vatRate) || 5;
+    const KEEP = ["basicRental", "otherCharges", "vat", "total", "previousBalance", "paymentReceived", "currentCharges", "billDate", "dueDate"];
+    let changed = false;
+    const next = bills.map((b) => {
+      if (!(b.analysed && (b.billVersion || 0) < PARSER_VERSION)) return b;
+      try {
+        if (b.rawText) {
+          const patch = heuristicParse(b.rawText, b.provider);
+          const merged = { ...b, billVersion: PARSER_VERSION };
+          KEEP.forEach((k) => { if (patch[k] !== undefined && patch[k] !== "") merged[k] = patch[k]; });
+          changed = true; return merged;
+        }
+        if (b.provider === "DU" && num(b.basicRental)) {
+          const vat = +(num(b.basicRental) * rate / 100).toFixed(2), tot = +(num(b.basicRental) + vat).toFixed(2);
+          changed = true; return { ...b, vat, currentCharges: tot, total: tot, billVersion: PARSER_VERSION };
+        }
+      } catch (e) { console.error("auto-upgrade failed", b.fileName, e); }
+      return b; // couldn't heal (no stored text) — leave it so a later re-analyse can
+    });
+    if (changed) { setBills(next); persist({ bills: next }); }
+  }, [bills, loaded]);
+
   const persist = async (patch) => {
     setSaving(true);
     const ts = new Date().toISOString();
@@ -1018,7 +1167,7 @@ function App({ supabase, session, onLogout }) {
         <div key={tab} className="page-in">
         {tab === "dashboard" && <Dashboard connections={connections} bills={bills} settings={settings} setTab={setTab} />}
         {tab === "connections" && <Connections connections={connections} save={saveConn} settings={settings} flash={flash} />}
-        {tab === "upload" && <BillUpload bills={bills} save={saveBills} flash={flash} />}
+        {tab === "upload" && <BillUpload bills={bills} save={saveBills} flash={flash} connections={connections} settings={settings} />}
         {tab === "analysis" && <Analysis bills={bills} saveBills={saveBills} connections={connections} settings={settings} flash={flash} addConnection={addConnection} setTab={setTab} notifyUnidentified={() => { supabase.rpc("notify_unidentified").catch((e) => console.error("notify failed", e)); }} />}
         {tab === "reports" && <Reports bills={bills} connections={connections} settings={settings} />}
         {tab === "payments" && <Payments bills={bills} receipts={receipts} saveReceipts={saveReceipts} connections={connections} settings={settings} flash={flash} />}
@@ -1558,8 +1707,10 @@ function CancelModal({ conn, onConfirm, onClose }) {
 }
 
 /* ============================== 3. BILL UPLOAD ============================== */
-function BillUpload({ bills, save, flash }) {
+function BillUpload({ bills, save, flash, connections, settings }) {
   const now = new Date();
+  const [manualOpen, setManualOpen] = useState(false);
+  const addManualBill = (b) => { save([...bills, b]); setManualOpen(false); flash("Bill added manually"); };
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth() + 1);
   const [provider, setProvider] = useState("Etisalat");
@@ -1639,18 +1790,21 @@ function BillUpload({ bills, save, flash }) {
               <FolderOpen size={16} style={{ color: T.teal }} />
               <span className="font-medium">{mkLabel(mk)} folder</span>
               <span style={{ color: T.sub }} className="text-xs">· {periodBills.length} file(s)</span>
-              {periodBills.length > 0 && (
-                <div className="flex items-center gap-2 ml-auto flex-wrap">
-                  {selected.length > 0 && (
-                    <React.Fragment>
-                      <span style={{ color: T.sub }} className="text-xs">{selected.length} selected</span>
-                      <Btn size="sm" variant="danger" onClick={deleteSelected}><Trash2 size={13} /> Delete selected</Btn>
-                      <button onClick={() => setSelected([])} className="text-xs" style={{ color: T.sub }}>Clear</button>
-                    </React.Fragment>
-                  )}
-                  <Btn size="sm" variant="ghost" onClick={deleteAllPeriod}><Trash2 size={13} /> Delete all</Btn>
-                </div>
-              )}
+              <div className="flex items-center gap-2 ml-auto flex-wrap">
+                <Btn size="sm" variant="ghost" onClick={() => setManualOpen(true)}><Plus size={13} /> Add bill manually</Btn>
+                {periodBills.length > 0 && (
+                  <React.Fragment>
+                    {selected.length > 0 && (
+                      <React.Fragment>
+                        <span style={{ color: T.sub }} className="text-xs">{selected.length} selected</span>
+                        <Btn size="sm" variant="danger" onClick={deleteSelected}><Trash2 size={13} /> Delete selected</Btn>
+                        <button onClick={() => setSelected([])} className="text-xs" style={{ color: T.sub }}>Clear</button>
+                      </React.Fragment>
+                    )}
+                    <Btn size="sm" variant="ghost" onClick={deleteAllPeriod}><Trash2 size={13} /> Delete all</Btn>
+                  </React.Fragment>
+                )}
+              </div>
             </div>
             {periodBills.length === 0 ? (
               <div className="px-5 py-10 text-center text-xs" style={{ color: T.sub }}>This period's folder is empty.</div>
@@ -1666,11 +1820,19 @@ function BillUpload({ bills, save, flash }) {
                     <FileText size={18} style={{ color: b.fileType === "application/pdf" ? T.red : T.blue }} />
                     <div className="flex-1 min-w-0">
                       <div className="truncate text-[13px] font-medium">{b.fileName}</div>
-                      <div style={{ color: T.sub }} className="text-xs flex items-center gap-2">
+                      <div style={{ color: T.sub }} className="text-xs flex items-center gap-2 flex-wrap">
                         <ProviderTag p={b.provider} /> {(b.size / 1024).toFixed(0)} KB
                         {b.analysed && <span style={{ color: T.tealDk }}>· entered</span>}
                         {!hasFile(b) && <span style={{ color: T.amber }}>· metadata only (no file)</span>}
                       </div>
+                      {(billPeriod(b) || b.previousBalance || b.paymentReceived || b.total) && (
+                        <div className="text-xs mt-1 flex items-center gap-2 flex-wrap">
+                          {billPeriod(b) && <span style={{ background: T.blueSoft || T.tealSoft, color: T.tealDk, fontWeight: 600 }} className="px-2 py-0.5 rounded">📅 {billPeriod(b)}</span>}
+                          {num(b.previousBalance) > 0 && <span style={{ color: T.amber }}>Prev due: {money(num(b.previousBalance), settings.currency)}</span>}
+                          {num(b.paymentReceived) > 0 && <span style={{ color: T.tealDk }}>Received: {money(num(b.paymentReceived), settings.currency)}</span>}
+                          {num(b.total) > 0 && <span style={{ color: T.text, fontWeight: 600 }}>This month: {money(num(b.total), settings.currency)}</span>}
+                        </div>
+                      )}
                     </div>
                     {hasFile(b) && <button onClick={() => viewBill(b)} className="p-1.5" style={{ color: T.sub }} title="View"><Search size={15} /></button>}
                     <button onClick={() => removeBill(b.id)} className="p-1.5" style={{ color: T.red }}><Trash2 size={15} /></button>
@@ -1701,6 +1863,7 @@ function BillUpload({ bills, save, flash }) {
           )}
         </Card>
       </div>
+      {manualOpen && <ManualBillModal connections={connections} settings={settings} onSave={addManualBill} onClose={() => setManualOpen(false)} />}
     </React.Fragment>
   );
 }
@@ -1708,7 +1871,7 @@ function BillUpload({ bills, save, flash }) {
 /* ============================== 4. ANALYSIS & ALLOCATION ============================== */
 function ManualBillModal({ connections, settings, onSave, onClose }) {
   const now = new Date();
-  const [f, setF] = useState({ provider: "Etisalat", accountNumber: "", invoiceNumber: "", year: now.getFullYear(), month: now.getMonth() + 1, invoicePeriod: "", basicRental: "", staff: "", vat: "", total: "" });
+  const [f, setF] = useState({ provider: "Etisalat", accountNumber: "", invoiceNumber: "", year: now.getFullYear(), month: now.getMonth() + 1, invoicePeriod: "", billDate: "", dueDate: "", planName: "", previousBalance: "", paymentReceived: "", currentCharges: "", basicRental: "", staff: "", vat: "", total: "" });
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   const vatRate = num(settings.vatRate) || 5;
   // auto compute helpers
@@ -1721,6 +1884,8 @@ function ManualBillModal({ connections, settings, onSave, onClose }) {
     onSave({
       id: "man" + Date.now().toString(36), provider: f.provider, accountNumber: f.accountNumber.trim(),
       invoiceNumber: f.invoiceNumber.trim(), monthKey: monthKey(f.year, f.month), invoicePeriod: f.invoicePeriod.trim(),
+      billDate: f.billDate.trim(), dueDate: f.dueDate.trim(), planName: f.planName.trim(),
+      previousBalance: num(f.previousBalance), paymentReceived: num(f.paymentReceived), currentCharges: num(f.currentCharges),
       basicRental: num(f.basicRental), vat: num(f.vat), total: num(f.total) || (num(f.basicRental) + num(f.staff) + num(f.vat)),
       extraUsages, otherCredits: 0, analysed: true, manual: true, uploadedAt: Date.now(),
     });
@@ -1733,8 +1898,13 @@ function ManualBillModal({ connections, settings, onSave, onClose }) {
         <Field label="Account / Service ID"><input value={f.accountNumber} onChange={(e) => set("accountNumber", e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. 0526327108" /></Field>
         <Field label="Invoice #"><input value={f.invoiceNumber} onChange={(e) => set("invoiceNumber", e.target.value)} style={inputStyle} className={inputCls} placeholder="INV…" /></Field>
         <Field label="Invoice period (optional)"><input value={f.invoicePeriod} onChange={(e) => set("invoicePeriod", e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. 01–31 Jan 2026" /></Field>
+        <Field label="Bill date (optional)"><input value={f.billDate} onChange={(e) => set("billDate", e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. 05 Jan 2026" /></Field>
+        <Field label="Due date (optional)"><input value={f.dueDate} onChange={(e) => set("dueDate", e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. 20 Jan 2026" /></Field>
         <Field label="Year"><select value={f.year} onChange={(e) => set("year", +e.target.value)} style={inputStyle} className={inputCls}>{years.map((y) => <option key={y} value={y}>{y}</option>)}</select></Field>
         <Field label="Month"><select value={f.month} onChange={(e) => set("month", +e.target.value)} style={inputStyle} className={inputCls}>{MONTHS.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}</select></Field>
+        <Field label="Previous balance (due)"><input value={f.previousBalance} onChange={(e) => set("previousBalance", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
+        <Field label="Payment received (prev.)"><input value={f.paymentReceived} onChange={(e) => set("paymentReceived", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
+        <Field label="Current charges"><input value={f.currentCharges} onChange={(e) => set("currentCharges", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
         <Field label="Basic rental (excl. VAT)"><input value={f.basicRental} onChange={(e) => set("basicRental", e.target.value)} onBlur={autoVat} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
         <Field label="Staff chargeable (optional)"><input value={f.staff} onChange={(e) => set("staff", e.target.value)} onBlur={autoVat} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
         <Field label="VAT"><input value={f.vat} onChange={(e) => set("vat", e.target.value)} onBlur={autoTotal} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
@@ -1788,7 +1958,7 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
         patch.extraUsages = bill.extraUsages || [];
       }
       refineFromFilename(patch, bill.fileName, bill.provider);
-      const merged = { ...patch, rawText: (content.text || "").slice(0, 8000) };
+      const merged = { ...patch, rawText: (content.text || "").slice(0, 8000), billVersion: PARSER_VERSION };
       const dmk = periodToMonthKey(patch.invoicePeriod); if (dmk) merged.monthKey = dmk;
       if (review) { updateBill(bill.id, merged); setOpen(bill.id); }
       else { updateBill(bill.id, { ...merged, analysed: true }); }
@@ -1797,9 +1967,9 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
       console.error(e); flash("Couldn't read this file — enter data manually"); if (review) setOpen(bill.id);
     } finally { setBusy(null); }
   };
-  const analyseAll = async () => {
-    const targets = bills.filter((b) => !b.analysed && hasFile(b));
-    if (!targets.length) { flash("No new bills to analyse (already-analysed bills are left as-is — use a row's Analyse button to redo one)"); return; }
+  const analyseAll = async (force = false) => {
+    const targets = force ? bills.filter((b) => hasFile(b)) : bills.filter((b) => !b.analysed && hasFile(b));
+    if (!targets.length) { flash("All bills are already analysed — they stay up to date automatically."); return; }
     const patches = {};
     for (const b of targets) {
       setBusy(b.id);
@@ -1816,7 +1986,7 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
         }
         refineFromFilename(patch, b.fileName, b.provider);
         const dmk = periodToMonthKey(patch.invoicePeriod);
-        patches[b.id] = { ...patch, rawText: (content.text || "").slice(0, 8000), analysed: true, ...(dmk ? { monthKey: dmk } : {}) };
+        patches[b.id] = { ...patch, rawText: (content.text || "").slice(0, 8000), analysed: true, billVersion: 2, ...(dmk ? { monthKey: dmk } : {}) };
       } catch (e) { console.error("analyse failed", b.fileName, e); }
     }
     setBusy(null);
@@ -1875,7 +2045,7 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
         <span style={{ color: settings.apiKey ? T.tealDk : T.sub }} className="text-xs mr-1">{settings.apiKey ? "● AI analysis on" : "Basic extraction (add API key in Settings for AI)"}</span>
         <Btn variant="ghost" size="sm" onClick={exportDetail}><Download size={14} /> Export detail</Btn>
         <Btn variant="ghost" size="sm" onClick={() => setManualOpen(true)}><Plus size={14} /> Add bill</Btn>
-        <Btn onClick={analyseAll} disabled={!!busy}><Sparkles size={15} /> Analyse all bills</Btn>
+        <Btn onClick={() => analyseAll(false)} disabled={!!busy}><Sparkles size={15} /> Analyse all bills</Btn>
       </PageHeader>
       <div className="p-8 space-y-6">
         {bills.length === 0 && <Card className="p-6 text-center text-sm" style={{ color: T.sub }}>No bills to analyse. Add invoices in <b>Bill Upload</b> first.</Card>}
@@ -1946,7 +2116,7 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
               <table className="w-full text-[13px]">
                 <thead>
                   <tr style={{ borderBottom: `1px solid ${T.line}`, color: T.sub }} className="text-left text-xs">
-                    {["File", "Provider", "Account", "Invoice #", "User / Company", "Rental", "Local calls & SMS", "Staff charge", "VAT", "Total", ""].map((h) => <th key={h} className="px-3 py-2.5 font-medium whitespace-nowrap">{h}</th>)}
+                    {["File", "Provider", "Account", "Invoice #", "Period", "User / Company", "Rental", "Usage Charges", "VAT", "Total", ""].map((h) => <th key={h} className="px-3 py-2.5 font-medium whitespace-nowrap">{h}</th>)}
                   </tr>
                 </thead>
                 <tbody>
@@ -1954,16 +2124,30 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
                     const a = b.analysed ? allocate(b, connections, settings) : null;
                     const matched = a?.conn;
                     const unmatched = b.analysed && String(b.accountNumber || "").trim() && !matched;
+                    const staffFlag = a && num(a.staff) > 0;
                     return (
-                      <tr key={b.id} style={{ borderBottom: `1px solid ${T.line}`, background: unmatched ? T.amberSoft : (b.approved ? "#EDF7F3" : "transparent") }}>
+                      <tr key={b.id} style={{ borderBottom: `1px solid ${T.line}`, background: unmatched ? T.amberSoft : (staffFlag ? "#F6ECFB" : (b.approved ? "#EDF7F3" : "transparent")), borderLeft: staffFlag ? `3px solid #9B5DE5` : "3px solid transparent" }}>
                         <td className="px-3 py-2.5 max-w-[160px] truncate">{b.fileName}</td>
                         <td className="px-3 py-2.5"><ProviderTag p={b.provider} /></td>
                         <td className="px-3 py-2.5">{b.accountNumber || <span style={{ color: T.sub }}>—</span>}</td>
                         <td className="px-3 py-2.5">{b.invoiceNumber || <span style={{ color: T.sub }}>—</span>}</td>
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          {billPeriod(b) ? <span style={{ color: T.tealDk, fontWeight: 600 }} className="text-xs">{billPeriod(b)}</span> : <span style={{ color: T.sub }} className="text-xs">{mkLabel(b.monthKey)}</span>}
+                          {(num(b.previousBalance) > 0 || num(b.paymentReceived) > 0) && (
+                            <div className="text-[11px] mt-0.5" style={{ color: T.sub }}>
+                              {num(b.previousBalance) > 0 && <span style={{ color: T.amber }}>prev due {money(num(b.previousBalance), cur)}</span>}
+                              {num(b.previousBalance) > 0 && num(b.paymentReceived) > 0 && " · "}
+                              {num(b.paymentReceived) > 0 && <span style={{ color: T.tealDk }}>rcvd {money(num(b.paymentReceived), cur)}</span>}
+                            </div>
+                          )}
+                        </td>
                         <td className="px-3 py-2.5">{a ? (matched ? <span>{a.user}<br /><span style={{ color: T.sub }} className="text-xs">{a.company}</span></span> : <span style={{ color: T.amber }} className="text-xs">no matching connection</span>) : "—"}</td>
                         <td className="px-3 py-2.5">{a ? money(a.basicRental, cur) : "—"}</td>
-                        <td className="px-3 py-2.5">{a ? (b.provider === "DU" ? "n/a" : money(a.localSms, cur)) : "—"}</td>
-                        <td className="px-3 py-2.5" style={{ color: a && a.staff ? T.amber : T.text }}>{a ? (b.provider === "DU" ? "n/a" : money(a.staff, cur)) : "—"}</td>
+                        <td className="px-3 py-2.5">
+                          {a ? (b.provider === "DU" ? <span style={{ color: T.sub }}>n/a</span> : (
+                            <span className="whitespace-nowrap">{money(a.other, cur)}{staffFlag && <span title="A staff-chargeable item was identified here — please review" style={{ background: "#9B5DE5", color: "#fff", marginLeft: 6, padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600 }}>staff?</span>}</span>
+                          )) : "—"}
+                        </td>
                         <td className="px-3 py-2.5">{a ? money(a.vat, cur) : "—"}</td>
                         <td className="px-3 py-2.5 font-medium">{a ? money(a.total, cur) : "—"}</td>
                         <td className="px-3 py-2.5">
@@ -1997,7 +2181,7 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
         })}
         {rows.length > 0 && <AllocationPreview rows={rows} settings={settings} />}
       </div>
-      {openBill && <BillEditModal bill={openBill} connections={connections} settings={settings} onSave={(patch) => { updateBill(openBill.id, { ...patch, analysed: true, approvedAt: patch.approved ? (openBill.approvedAt || Date.now()) : null }); setOpen(null); flash("Bill saved"); }} onClose={() => setOpen(null)} />}
+      {openBill && <BillEditModal key={`${openBill.id}:${openBill.billVersion || 0}:${(openBill.rawText || "").length}`} bill={openBill} connections={connections} settings={settings} onSave={(patch) => { updateBill(openBill.id, { ...patch, analysed: true, approvedAt: patch.approved ? (openBill.approvedAt || Date.now()) : null }); setOpen(null); flash("Bill saved"); }} onClose={() => setOpen(null)} />}
       {addConn && <ConnectionModal conn={null} settings={settings} nextSN={nextSN(connections)} prefill={addConn} onSave={(f) => { addConnection(f); setAddConn(null); flash("Connection added — bill now identified"); }} onClose={() => setAddConn(null)} />}
       {manualOpen && <ManualBillModal connections={connections} settings={settings} onSave={addManualBill} onClose={() => setManualOpen(false)} />}
       {preview && (
@@ -2013,14 +2197,65 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
   );
 }
 function BillEditModal({ bill, connections, settings, onSave, onClose }) {
-  const [f, setF] = useState({
-    accountNumber: bill.accountNumber || "", invoiceNumber: bill.invoiceNumber || "",
-    invoicePeriod: bill.invoicePeriod || "", basicRental: bill.basicRental || "",
-    vat: bill.vat || "", total: bill.total || "", otherCredits: bill.otherCredits || "",
-    extraUsages: bill.extraUsages || [], approved: bill.approved || false,
-  });
-  const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
   const isEt = bill.provider === "Etisalat"; const cur = settings.currency;
+  // Backfill blanks straight from the stored bill text — so bills analysed by an older
+  // version still auto-fill (and get corrected) the moment you open them, no re-analyse needed.
+  const _ex = extractBillExtras(bill.rawText || "", bill.provider);
+  const _pick = (a, b) => (a === "" || a === undefined || a === null) ? (b === "" || b === undefined || b === null ? "" : b) : a;
+  // resolve the true CURRENT-MONTH figures (this is the bill's expense for the period).
+  // Bills saved by this version carry billVersion>=2 — we trust those. Older/buggy bills are
+  // re-derived from the stored text and, if needed, computed deterministically (VAT = rental×rate).
+  const vatRate = num(settings.vatRate) || 5;
+  const trust = (bill.billVersion || 0) >= PARSER_VERSION;
+  const _rent = num(bill.basicRental) || "";
+  // "Other" = current-month non-rental charges (Etisalat Usage/One-Time). Prefer fresh text.
+  const _other = num(_ex.otherCharges) || (trust ? num(bill.otherCharges) : "") || "";
+  // VAT = 5% of the taxable base (Etisalat: rental + other; DU: rental only). We COMPUTE it and only
+  // keep a stored/printed value if it matches — this auto-corrects mis-read VAT (e.g. 3120 vs 176).
+  // VAT: read off the bill; DU falls back to rental×5% (= printed VAT), Etisalat reconciles to the printed total.
+  let _vat = num(_ex.vat) || num(bill.vat) || "";
+  let _cur;
+  if (isEt) {
+    const parts = +(num(_rent) + num(_other)).toFixed(2);
+    const printed = num(_ex.currentCharges) || (trust ? num(bill.currentCharges) : 0) || num(bill.total);
+    if (printed && (_vat === "" || Math.abs(parts + num(_vat) - printed) > 0.5)) _vat = +(printed - parts).toFixed(2);
+    if (_vat === "") _vat = +(parts * 5 / 100).toFixed(2);
+    _cur = printed || +(parts + num(_vat)).toFixed(2);
+  } else {
+    const expect = +(num(_rent) * 5 / 100).toFixed(2);
+    if (_vat === "" || Math.abs(num(_vat) - expect) > Math.max(0.5, expect * 0.02)) _vat = expect;
+    _cur = +(num(_rent) + num(_other) + num(_vat)).toFixed(2);
+  }
+  const _monthTotal = _cur || "";
+  // previous pending: prefer fresh text, else stored
+  const _prev = num(_ex.previousBalance) || num(bill.previousBalance) || "";
+  // payment received: prefer fresh; keep a stored value only if it's plausible (≤ previous) — drops old garbage like grabbing the grand total
+  let _pay = num(_ex.paymentReceived) || "";
+  if (_pay === "") { const sp = num(bill.paymentReceived); _pay = (trust || (sp && _prev && sp <= _prev + 0.01)) ? sp : ""; }
+  const initF = {
+    accountNumber: bill.accountNumber || "", invoiceNumber: bill.invoiceNumber || "",
+    invoicePeriod: billPeriod(bill) || bill.invoicePeriod || "",
+    billDate: _pick(bill.billDate, _ex.billDate), dueDate: _pick(bill.dueDate, _ex.dueDate), planName: bill.planName || "",
+    basicRental: bill.basicRental || "", otherCharges: _other === "" ? "" : _other,
+    previousBalance: _prev === "" ? "" : _prev, paymentReceived: _pay === "" ? "" : _pay,
+    currentCharges: _cur === "" ? "" : _cur,
+    vat: _vat === "" ? "" : _vat, otherCredits: bill.otherCredits || "",
+    extraUsages: bill.extraUsages || [], approved: bill.approved || false,
+    amountDue: bill.amountDue || "", payPrev: !!bill.payPrev,
+  };
+  const [f, setF] = useState(initF);
+  // period stays frozen (read-only) unless the user unlocks it — stops good data being overwritten by accident
+  const [periodLocked, setPeriodLocked] = useState(true);
+  const set = (k, v) => setF((s) => ({ ...s, [k]: v }));
+  // TOTAL is Rental + Other + VAT. VAT is READ from the bill (editable). Total updates live.
+  const rentalN = num(f.basicRental), otherN = num(f.otherCharges), vatN = num(f.vat);
+  const total = +(rentalN + otherN + vatN).toFixed(2);
+  const currentMonthDue = total;
+  // net previous pending: Etisalat prints bill + a matching payment; DU's "minimum payment" is already net
+  const prevPending = isEt ? +Math.max(0, num(f.previousBalance) - num(f.paymentReceived)).toFixed(2) : num(f.previousBalance);
+  const dueSuggested = +(currentMonthDue + (f.payPrev ? prevPending : 0)).toFixed(2);
+  const dueShown = f.amountDue === "" ? (dueSuggested || "") : f.amountDue;
+  const autoDue = () => set("amountDue", String(dueSuggested));
   const matched = connections.find((c) => normAcc(c.accountNumber) && normAcc(c.accountNumber) === normAcc(f.accountNumber));
   const addUse = () => set("extraUsages", [...f.extraUsages, { description: "", amount: "", category: "Staff chargeable" }]);
   const setUse = (i, k, v) => set("extraUsages", f.extraUsages.map((u, idx) => (idx === i ? { ...u, [k]: v } : u)));
@@ -2031,25 +2266,72 @@ function BillEditModal({ bill, connections, settings, onSave, onClose }) {
       <div className="grid grid-cols-3 gap-3">
         <Field label="Account number"><input value={f.accountNumber} onChange={(e) => set("accountNumber", e.target.value)} style={inputStyle} className={inputCls} /></Field>
         <Field label="Invoice number"><input value={f.invoiceNumber} onChange={(e) => set("invoiceNumber", e.target.value)} style={inputStyle} className={inputCls} /></Field>
-        <Field label="Invoice period"><input value={f.invoicePeriod} onChange={(e) => set("invoicePeriod", e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. 01–31 May 2026" /></Field>
+        <Field label="Invoice period (frozen)">
+          <div className="relative">
+            <input value={f.invoicePeriod} readOnly={periodLocked} onChange={(e) => set("invoicePeriod", e.target.value)} style={{ ...inputStyle, paddingRight: 34, background: periodLocked ? T.paper : undefined, color: periodLocked ? T.sub : undefined }} className={inputCls} placeholder="e.g. 01–31 May 2026" title={periodLocked ? "Locked — read from the bill. Click the lock to edit." : "Editable"} />
+            <button type="button" onClick={() => setPeriodLocked((v) => !v)} title={periodLocked ? "Unlock to edit the period" : "Lock the period"} style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", color: periodLocked ? T.sub : T.teal, padding: 4 }}>
+              {periodLocked ? <Lock size={14} /> : <Unlock size={14} />}
+            </button>
+          </div>
+        </Field>
+      </div>
+      <div className="grid grid-cols-3 gap-3 mt-3">
+        <Field label="Bill date"><input value={f.billDate} onChange={(e) => set("billDate", e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. 05 May 2026" /></Field>
+        <Field label="Due date"><input value={f.dueDate} onChange={(e) => set("dueDate", e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. 20 May 2026" /></Field>
+        <Field label="Plan / package"><input value={f.planName} onChange={(e) => set("planName", e.target.value)} style={inputStyle} className={inputCls} placeholder="optional" /></Field>
       </div>
       {f.accountNumber && <div className="mt-2 text-xs" style={{ color: matched ? T.tealDk : T.amber }}>{matched ? `✓ Matches ${matched.userName} · ${matched.company} · ${matched.department}` : "No connection matches this account number (add it under Connections)"}</div>}
-      <div className="grid grid-cols-3 gap-3 mt-3">
-        <Field label={isEt ? "Basic rental" : "Rental (pre-VAT)"}><input type="number" value={f.basicRental} onChange={(e) => set("basicRental", e.target.value)} style={inputStyle} className={inputCls} /></Field>
-        <Field label="VAT"><input type="number" value={f.vat} onChange={(e) => set("vat", e.target.value)} style={inputStyle} className={inputCls} placeholder="auto if blank" /></Field>
-        <Field label="Total (incl. VAT)"><input type="number" value={f.total} onChange={(e) => set("total", e.target.value)} style={inputStyle} className={inputCls} placeholder="auto if blank" /></Field>
+      <div className="mt-4 text-[11px] font-semibold uppercase tracking-wide" style={{ color: T.sub }}>This month's charges</div>
+      <div className="grid grid-cols-4 gap-3 mt-1.5">
+        <Field label={isEt ? "Rental" : "Rental (pre-VAT)"}><input type="number" value={f.basicRental} onChange={(e) => set("basicRental", e.target.value)} style={inputStyle} className={inputCls} /></Field>
+        <Field label="Other (usage etc.)"><input type="number" value={f.otherCharges} onChange={(e) => set("otherCharges", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" title="Any current-month charge that isn't rental — Usage, One-Time, etc." /></Field>
+        <Field label="VAT"><input type="number" value={f.vat} onChange={(e) => set("vat", e.target.value)} style={inputStyle} className={inputCls} placeholder="from bill" title="Read from the bill's VAT line — edit only if the bill differs" /></Field>
+        <Field label="Total (incl. VAT)">
+          <input type="number" value={total || ""} readOnly style={{ ...inputStyle, background: T.paper, color: T.text, fontWeight: 600 }} className={inputCls} title="Rental + Other + VAT — computed automatically" />
+        </Field>
+      </div>
+      <p className="text-[11px] mt-1" style={{ color: T.sub }}>Total = Rental + Other + VAT = <b style={{ color: T.text }}>{money(total, cur)}</b>. Previous balance is kept separate below and never added here.</p>
+      <div className="mt-4 rounded-lg p-3" style={{ background: T.amberSoft, border: `1px solid ${T.amber}44` }}>
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <span className="text-[13px] font-medium" style={{ color: T.amber }}>Amount to pay — this month's due</span>
+            <p className="text-[11px]" style={{ color: T.sub }}>Defaults to the current month's charge only. Previous pending is kept separate — tick the box to add it.</p>
+          </div>
+          <Btn variant="ghost" size="sm" onClick={autoDue}>Auto</Btn>
+        </div>
+        <div className="grid grid-cols-4 gap-3 items-end">
+          <div className="col-span-1">
+            <Field label="Amount to pay"><input type="number" value={f.amountDue} onChange={(e) => set("amountDue", e.target.value)} style={{ ...inputStyle, fontWeight: 600 }} className={inputCls} placeholder={currentMonthDue ? String(dueSuggested) : "0.00"} /></Field>
+          </div>
+          <div className="col-span-3 text-[11px] flex flex-wrap gap-x-3 gap-y-1 items-center" style={{ color: T.sub }}>
+            <span>Current month due: <b style={{ color: T.text }}>{money(currentMonthDue, cur)}</b></span>
+            <span>Previous pending (separate): <b style={{ color: prevPending > 0 ? T.amber : T.text }}>{money(prevPending, cur)}</b></span>
+            {prevPending > 0 && (
+              <label className="flex items-center gap-1.5 cursor-pointer select-none w-full mt-0.5">
+                <input type="checkbox" checked={f.payPrev} onChange={(e) => { set("payPrev", e.target.checked); set("amountDue", ""); }} style={{ accentColor: T.amber, width: 14, height: 14 }} />
+                <span>Also pay previous pending (pay total {money(currentMonthDue + prevPending, cur)})</span>
+              </label>
+            )}
+            <span className="w-full" style={{ color: T.amber }}>= Suggested to pay: <b>{money(dueSuggested, cur)}</b>{f.amountDue !== "" && num(f.amountDue) !== dueSuggested && <span style={{ color: T.sub }}> · you set {money(num(f.amountDue), cur)}</span>}</span>
+          </div>
+        </div>
+      </div>
+      <div className="mt-5 text-[11px] font-semibold uppercase tracking-wide" style={{ color: T.sub }}>Period &amp; other details <span className="normal-case font-normal">— kept separate, shown in reports, never added to the total above</span></div>
+      <div className="grid grid-cols-2 gap-3 mt-1.5">
+        <Field label="Previous balance / pending (due)"><input type="number" value={f.previousBalance} onChange={(e) => set("previousBalance", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
+        <Field label="Payment received (against previous)"><input type="number" value={f.paymentReceived} onChange={(e) => set("paymentReceived", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
       </div>
       {isEt ? (
-        <div className="mt-5">
+        <div className="mt-4">
           <div className="flex items-center justify-between mb-2">
             <div>
-              <span style={{ color: T.sub }} className="text-xs font-medium">Extra usage breakdown</span>
-              <p style={{ color: T.sub }} className="text-[11px]">Local calls &amp; SMS add to rental cost; staff-chargeable items are recovered from staff. Describe each charge.</p>
+              <span style={{ color: T.sub }} className="text-xs font-medium">Local calls &amp; staff-chargeable breakdown</span>
+              <p style={{ color: T.sub }} className="text-[11px]">Split the "Other" amount into local calls &amp; SMS vs staff-chargeable, so staff recoveries show in reports. This does not change the total.</p>
             </div>
             <Btn variant="ghost" size="sm" onClick={addUse}><Plus size={13} /> Add line</Btn>
           </div>
           <div style={{ border: `1px solid ${T.line}` }} className="rounded-lg">
-            {f.extraUsages.length === 0 && <div className="px-3 py-4 text-xs text-center" style={{ color: T.sub }}>No extra usage.</div>}
+            {f.extraUsages.length === 0 && <div className="px-3 py-4 text-xs text-center" style={{ color: T.sub }}>No breakdown added — the "Other" amount ({money(otherN, cur)}) stays with the company.</div>}
             {f.extraUsages.map((u, i) => (
               <div key={i} className="p-2 flex items-center gap-2" style={{ borderTop: i ? `1px solid ${T.line}` : "none" }}>
                 <input value={u.description} onChange={(e) => setUse(i, "description", e.target.value)} placeholder="What is this usage?" style={inputStyle} className={inputCls} />
@@ -2070,7 +2352,7 @@ function BillEditModal({ bill, connections, settings, onSave, onClose }) {
         </label>
         <div className="flex gap-2">
           <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
-          <Btn onClick={() => onSave(f)}><Save size={15} /> Save bill</Btn>
+          <Btn onClick={() => onSave({ ...f, vat: vatN, total, otherCharges: num(f.otherCharges), currentCharges: currentMonthDue, amountDue: dueShown === "" ? 0 : num(dueShown), prevPending, billVersion: PARSER_VERSION })}><Save size={15} /> Save bill</Btn>
         </div>
       </div>
       {bill.rawText && (
@@ -2160,6 +2442,8 @@ const REPORTS = [
   { id: "finance", label: "Finance & Cost Allocation" },
   { id: "package", label: "Basic Package Detail" },
   { id: "comparison", label: "Monthly Comparison" },
+  { id: "pending", label: "Pending / Outstanding" },
+  { id: "vat", label: "VAT Report" },
   { id: "summary", label: "User / Account Summary" },
   { id: "staff", label: "Staff Charge Detail" },
   { id: "unidentified", label: "Unidentified Accounts" },
@@ -2248,10 +2532,39 @@ function buildReport(type, ctx) {
   const M = (n) => money(n, cur);
   const sum = (arr, k) => arr.reduce((s, x) => s + (x[k] || 0), 0);
 
+  if (type === "vat") {
+    const rate = num(settings.vatRate) || 5;
+    const taxable = (a) => +((num(a.vat) * 100) / rate).toFixed(2); // amount VAT was charged on
+    // 1) line-by-line
+    const head = ["S/N", "Account #", "User", "Company", "Provider", "Bill Period", "Month", "Taxable amount", `VAT (${rate}%)`, "Total (incl. VAT)"];
+    const body = rows.map((a, i) => [i + 1, a.accountNumber, a.user, a.company, a.provider, a.invoicePeriod || mkLabel(a.month), mkLabel(a.month), M(taxable(a)), M(a.vat), M(a.total)]);
+    const tr = ["", "", "", "", "", "", "TOTAL", M(sum(rows.map((a) => ({ t: taxable(a) })), "t")), M(sum(rows, "vat")), M(sum(rows, "total"))]; tr._total = true; body.push(tr);
+    // 2) by month
+    const months = [...new Set(rows.map((a) => a.month))].sort();
+    const mHead = ["Month", "Bills", "Taxable amount", `VAT (${rate}%)`, "Total (incl. VAT)"];
+    const mBody = months.map((mk) => { const g = rows.filter((a) => a.month === mk); return [mkLabel(mk), g.length, M(g.reduce((s, a) => s + taxable(a), 0)), M(sum(g, "vat")), M(sum(g, "total"))]; });
+    const mt = ["TOTAL", rows.length, M(rows.reduce((s, a) => s + taxable(a), 0)), M(sum(rows, "vat")), M(sum(rows, "total"))]; mt._total = true; mBody.push(mt);
+    // 3) by account
+    const byAcc = {}; rows.forEach((a) => { const k = a.accountNumber || a.user; (byAcc[k] = byAcc[k] || { a, tax: 0, vat: 0, total: 0 }); byAcc[k].tax += taxable(a); byAcc[k].vat += num(a.vat); byAcc[k].total += num(a.total); });
+    const aHead = ["Account #", "User", "Company", "Provider", "Taxable amount", `VAT (${rate}%)`, "Total (incl. VAT)"];
+    const aBody = Object.entries(byAcc).sort((x, y) => y[1].vat - x[1].vat).map(([k, o]) => [k, o.a.user, o.a.company, o.a.provider, M(o.tax), M(o.vat), M(o.total)]);
+    const at = ["", "", "", "TOTAL", M(Object.values(byAcc).reduce((s, o) => s + o.tax, 0)), M(Object.values(byAcc).reduce((s, o) => s + o.vat, 0)), M(Object.values(byAcc).reduce((s, o) => s + o.total, 0))]; at._total = true; aBody.push(at);
+    // 4) by period
+    const byPer = {}; rows.forEach((a) => { const k = a.invoicePeriod || mkLabel(a.month); (byPer[k] = byPer[k] || { tax: 0, vat: 0, total: 0, n: 0 }); byPer[k].tax += taxable(a); byPer[k].vat += num(a.vat); byPer[k].total += num(a.total); byPer[k].n++; });
+    const pHead = ["Bill Period", "Bills", "Taxable amount", `VAT (${rate}%)`, "Total (incl. VAT)"];
+    const pBody = Object.entries(byPer).map(([k, o]) => [k, o.n, M(o.tax), M(o.vat), M(o.total)]);
+    const pt = ["TOTAL", rows.length, M(Object.values(byPer).reduce((s, o) => s + o.tax, 0)), M(Object.values(byPer).reduce((s, o) => s + o.vat, 0)), M(Object.values(byPer).reduce((s, o) => s + o.total, 0))]; pt._total = true; pBody.push(pt);
+    return { title: "VAT Report", sheets: [
+      { name: "VAT by Bill", head, body },
+      { name: "VAT by Month", head: mHead, body: mBody },
+      { name: "VAT by Account", head: aHead, body: aBody },
+      { name: "VAT by Period", head: pHead, body: pBody },
+    ] };
+  }
   if (type === "finance") {
-    const head = ["S/N", "Account #", "User", "Company", "Department", "Month", "Basic Rental", "Extra Usage (Local Calls & SMS)", "Staff Charges", "Other Credits", "VAT", "Total"];
-    const body = rows.map((a, i) => [i + 1, a.accountNumber, a.user, a.company, a.department, mkLabel(a.month), M(a.basicRental), M(a.localSms), M(a.staff), M(a.otherCredits), M(a.vat), M(a.total)]);
-    const totalRow = ["", "", "", "", "", "TOTAL", M(sum(rows, "basicRental")), M(sum(rows, "localSms")), M(sum(rows, "staff")), M(sum(rows, "otherCredits")), M(sum(rows, "vat")), M(sum(rows, "total"))];
+    const head = ["S/N", "Account #", "User", "Company", "Department", "Month", "Rental", "Other (usage)", "of which Local Calls", "of which Staff", "VAT", "Total"];
+    const body = rows.map((a, i) => [i + 1, a.accountNumber, a.user, a.company, a.department, mkLabel(a.month), M(a.basicRental), M(a.other), M(a.localSms), M(a.staff), M(a.vat), M(a.total)]);
+    const totalRow = ["", "", "", "", "", "TOTAL", M(sum(rows, "basicRental")), M(sum(rows, "other")), M(sum(rows, "localSms")), M(sum(rows, "staff")), M(sum(rows, "vat")), M(sum(rows, "total"))];
     totalRow._total = true; body.push(totalRow);
     const byCo = {}; rows.forEach((a) => (byCo[a.company] = (byCo[a.company] || 0) + a.companyCost));
     const allocHead = ["Company", "Allocated Cost (company-borne)"];
@@ -2267,6 +2580,19 @@ function buildReport(type, ctx) {
       return [c.sn, c.accountNumber, c.userName, c.company, c.department, c.provider, M(t.base), elig || "—", M(t.sub), M(t.vat), M(t.total), c.initiatedDate || "—", c.status === "cancelled" ? "Cancelled" : "Active"];
     });
     return { title: "Basic Package Detail", sheets: [{ name: "Package Detail", head, body }] };
+  }
+  if (type === "pending") {
+    // outstanding = previous pending carried into the bill, plus anything not yet approved/committed
+    const pend = rows.filter((a) => (a.prevPending || 0) > 0.001);
+    const head = ["S/N", "Account #", "User", "Company", "Provider", "Month", "Due date", "Current month due", "Previous pending", "Total outstanding"];
+    const body = pend.map((a, i) => [i + 1, a.accountNumber, a.user, a.company, a.provider, mkLabel(a.month), a.dueDate || "—", M(a.amountDue), M(a.prevPending), M(num(a.amountDue) + num(a.prevPending))]);
+    const tr = ["", "", "", "", "", "", "TOTAL", M(sum(pend, "amountDue")), M(sum(pend, "prevPending")), M(sum(pend, "amountDue") + sum(pend, "prevPending"))]; tr._total = true; body.push(tr);
+    // group outstanding by company
+    const byCo = {}; pend.forEach((a) => (byCo[a.company] = (byCo[a.company] || 0) + num(a.prevPending)));
+    const coHead = ["Company", "Previous pending (outstanding)"];
+    const coBody = Object.entries(byCo).sort((a, b) => b[1] - a[1]).map(([c, v]) => [c, M(v)]);
+    const ct = ["TOTAL", M(Object.values(byCo).reduce((s, v) => s + v, 0))]; ct._total = true; coBody.push(ct);
+    return { title: "Pending / Outstanding", sheets: [{ name: "Pending by Bill", head, body }, { name: "Outstanding by Company", head: coHead, body: coBody }] };
   }
   if (type === "comparison") {
     const months = [...new Set(rows.map((a) => a.month))].sort();
@@ -2319,7 +2645,14 @@ function printReport(data, settings, range) {
 
 /* ============================== MODALS / SETTINGS ============================== */
 function Modal({ title, children, onClose, wide, xl }) {
-  return (
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e) => { if (e.key === "Escape" && onClose) onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => { document.body.style.overflow = prev; window.removeEventListener("keydown", onKey); };
+  }, []);
+  const node = (
     <div className="fixed inset-0 z-40 flex items-start justify-center p-4 overflow-y-auto" style={{ background: "rgba(14,38,46,.45)" }}>
       <div style={{ background: T.card, width: xl ? 1000 : wide ? 720 : 460 }} className="rounded-xl shadow-2xl my-8 max-w-full">
         <div className="px-6 py-4 flex items-center justify-between" style={{ borderBottom: `1px solid ${T.line}` }}>
@@ -2330,6 +2663,7 @@ function Modal({ title, children, onClose, wide, xl }) {
       </div>
     </div>
   );
+  return ReactDOM.createPortal(node, document.body);
 }
 function ImportResultModal({ res, onClose }) {
   return (
