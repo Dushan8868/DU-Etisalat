@@ -92,7 +92,7 @@ const THEMES = {
 const applyThemeToT = (id) => { const p = THEMES[id] || THEMES.default; Object.keys(p).forEach((k) => { if (k !== "group" && k !== "name") T[k] = p[k]; }); };
 const PROVIDERS = ["Etisalat", "DU"];
 // Bump this whenever the bill parser improves — older bills auto-upgrade on load (see App).
-const PARSER_VERSION = 10;
+const PARSER_VERSION = 12;
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const USAGE_CATS = ["Local calls & SMS", "Staff chargeable"];
 
@@ -127,6 +127,7 @@ const ICONS = {
   save: '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
   dot: '<circle cx="12" cy="12" r="3"/>',
   lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/>',
   unlock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.9-1"/>',
   history: '<path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/>',
   receipt: '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1Z"/><path d="M8 7h8"/><path d="M8 11h8"/><path d="M8 15h5"/>',
@@ -148,7 +149,7 @@ const LayoutDashboard = mk_("dashboard"), Network = mk_("network"), Upload = mk_
   Loader2 = mk_("loader"), AlertCircle = mk_("alert"), Building2 = mk_("building"),
   CalendarDays = mk_("calendar"), Sparkles = mk_("sparkles"), Search = mk_("search"),
   ArrowUpRight = mk_("arrowur"), ArrowDownRight = mk_("arrowdr"), Minus = mk_("minus"),
-  FolderOpen = mk_("folder"), Save = mk_("save"), History = mk_("history"), Receipt = mk_("receipt"), Review = mk_("review"), Eye = mk_("eye"), Palette = mk_("palette"), Lock = mk_("lock"), Unlock = mk_("unlock");
+  FolderOpen = mk_("folder"), Save = mk_("save"), History = mk_("history"), Receipt = mk_("receipt"), Review = mk_("review"), Eye = mk_("eye"), Palette = mk_("palette"), Lock = mk_("lock"), Unlock = mk_("unlock"), Mail = mk_("mail");
 
 /* ============================== STORAGE (localStorage) ============================== */
 const K = { conn: "tem:connections", bills: "tem:bills", settings: "tem:settings" };
@@ -280,12 +281,23 @@ function allocate(bill, connections, settings) {
   // For any auto-parsed bill (not hand-edited & saved in the modal), re-read its figures FRESH from
   // the stored bill text every time — never trust possibly-stale stored numbers for the display.
   let b = bill;
-  if (bill.rawText && (bill.billVersion || 0) < PARSER_VERSION) {
+  const stale = bill.rawText && (bill.billVersion || 0) < PARSER_VERSION;
+  if (stale && !bill.approved) {
+    // Not yet approved → re-read every figure fresh from the stored text.
     try {
       const p = heuristicParse(bill.rawText, bill.provider);
       b = { ...bill };
       ["basicRental", "otherCharges", "vat", "total", "currentCharges", "previousBalance", "paymentReceived", "billDate", "dueDate"].forEach((k) => { if (p[k] !== undefined && p[k] !== "") b[k] = p[k]; });
     } catch (e) { /* keep original figures on any parse issue */ }
+  } else if (bill.approved && bill.rawText) {
+    // Approved/verified → the EXPENSE figures (rental/other/vat/total) stay locked so a verified month
+    // never changes. But the previous-balance / payment / pending are refreshed so they always show right.
+    try {
+      const p = heuristicParse(bill.rawText, bill.provider);
+      b = { ...bill,
+        previousBalance: p.previousBalance !== "" && p.previousBalance != null ? p.previousBalance : bill.previousBalance,
+        paymentReceived: p.paymentReceived !== "" && p.paymentReceived != null ? p.paymentReceived : bill.paymentReceived };
+    } catch (e) { /* keep stored */ }
   }
   const conn = connections.find(
     (c) => normAcc(c.accountNumber) && normAcc(c.accountNumber) === normAcc(b.accountNumber)
@@ -311,7 +323,7 @@ function allocate(bill, connections, settings) {
     basicRental, other, localSms: localSmsUse, staff: staffUse, staffLines, otherCredits: num(b.otherCredits), vat, total,
     approved: !!b.approved, approvedAt: b.approvedAt || null,
     previousBalance: num(b.previousBalance), paymentReceived: num(b.paymentReceived), dueDate: b.dueDate || "",
-    prevPending: b.prevPending != null ? num(b.prevPending) : (b.provider === "Etisalat" ? +Math.max(0, num(b.previousBalance) - num(b.paymentReceived)).toFixed(2) : num(b.previousBalance)),
+    prevPending: b.prevPending != null ? num(b.prevPending) : +Math.max(0, num(b.previousBalance) - num(b.paymentReceived)).toFixed(2),
     amountDue: b.amountDue != null && b.amountDue !== "" ? num(b.amountDue) : total,
     companyCost: +(total - staffUse).toFixed(2),
   };
@@ -407,6 +419,75 @@ async function readBillContent(bill) {
   }
   return { text: "", imageDataUrl: b64, base64: b64 };
 }
+// Read a File (receipt PDF or image) to text via pdf.js, with Tesseract OCR fallback for scanned files.
+async function readFileText(file) {
+  if (!file) return "";
+  // Image receipts → OCR directly
+  if (file.type.startsWith("image/")) {
+    if (!window.Tesseract) return "";
+    const dataUrl = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(file); });
+    try { const r = await window.Tesseract.recognize(dataUrl, "eng"); return (r.data.text || "").trim(); } catch (e) { return ""; }
+  }
+  if (file.type !== "application/pdf" || !window.pdfjsLib) return "";
+  const buf = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
+  let text = ""; const maxPages = Math.min(pdf.numPages, 4);
+  for (let p = 1; p <= maxPages; p++) { const page = await pdf.getPage(p); const content = await page.getTextContent(); text += content.items.map((it) => it.str).join(" ") + "\n"; }
+  text = text.trim();
+  // Scanned/image PDF (no text layer) → rasterise page 1 and OCR it.
+  if (text.length < 20 && window.Tesseract) {
+    try {
+      const page = await pdf.getPage(1);
+      const viewport = page.getViewport({ scale: 2 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width; canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      const r = await window.Tesseract.recognize(canvas.toDataURL("image/png"), "eng");
+      text = (r.data.text || "").trim();
+    } catch (e) { console.error("Receipt OCR failed", e); }
+  }
+  return text;
+}
+// Best-effort parse of a payment receipt: amount, date, reference, and a description note.
+function parseReceipt(text) {
+  const t = (text || "").replace(/\s+/g, " ").replace(/\u2212/g, "-");
+  const out = { amount: "", date: "", reference: "", note: "" };
+  if (!t) return out;
+  // amount — prefer "Amount Paid X AED" / "Amount Paid AED X", else "X AED", else the largest figure
+  let am = t.match(/amount paid[^0-9]{0,8}(\d[\d,]*\.\d{2})/i) || t.match(/amount paid[^0-9]{0,8}aed[^0-9]{0,4}(\d[\d,]*\.\d{2})/i) || t.match(/(\d[\d,]*\.\d{2})\s*AED/i) || t.match(/AED\s*(\d[\d,]*\.\d{2})/i);
+  if (am) out.amount = parseFloat(am[1].replace(/,/g, ""));
+  if (out.amount === "") { const all = [...t.matchAll(/(\d[\d,]*\.\d{2})/g)].map((m) => parseFloat(m[1].replace(/,/g, ""))); if (all.length) out.amount = Math.max(...all); }
+  // date — ISO yyyy-mm-dd (Date & Time 2026-02-05 ...) first, then dd Mon yyyy / dd-mm-yyyy
+  let dm = (t.match(/date\s*&?\s*time[^0-9]{0,10}(\d{4})-(\d{2})-(\d{2})/i) || t.match(/(\d{4})-(\d{2})-(\d{2})/));
+  if (dm) out.date = `${dm[1]}-${dm[2]}-${dm[3]}`;
+  else { const D = "(\\d{1,2}(?:st|nd|rd|th)?[\\s\\/\\-.]+[A-Za-z]{3,9}[\\s\\/\\-.]+\\d{2,4}|\\d{1,2}[\\/\\-.]\\d{1,2}[\\/\\-.]\\d{2,4})"; for (const l of ["payment date", "transaction date", "paid on", "date & time", "date"]) { const m = t.match(new RegExp(l + "[^0-9]{0,20}" + D, "i")); if (m) { out.date = toISODate(m[1]); break; } } }
+  // reference — "YOUR REFERENCE NO. IS B2B..." / "reference no X" / "transaction id X"
+  let rm = t.match(/reference\s*(?:no\.?|number)?\.?\s*(?:is)?\s*[:\-]?\s*(B2B[A-Za-z0-9\-]+|[A-Za-z0-9][A-Za-z0-9\-]{4,})/i) || t.match(/transaction (?:id|reference)[^A-Za-z0-9]{0,6}([A-Za-z0-9\-]{4,})/i);
+  if (rm) out.reference = rm[1];
+  // company name (Etisalat receipts)
+  let cm = t.match(/company name\s+([A-Za-z0-9][A-Za-z0-9 .&,\-]{3,70}?)\s+(?:amount paid|date\s*&|payment method)/i);
+  const company = cm ? cm[1].trim().replace(/\s+/g, " ") : "";
+  // accounts paid for
+  const bulk = t.match(/payment for (\d+)\s+accounts/i);            // "payment for 62 accounts"
+  const single = t.match(/payment for (\d{6,})\s+has/i);            // "payment for 042357533 has..."
+  const tableAccts = [...t.matchAll(/(\d{9,})\s+AED\s*[\d,]/gi)].map((m) => m[1]);
+  let acctDesc = "";
+  if (tableAccts.length) acctDesc = `${tableAccts.length} account${tableAccts.length > 1 ? "s" : ""}: ${tableAccts.join(", ")}`;
+  else if (bulk) acctDesc = `${bulk[1]} accounts (bulk payment)`;
+  else if (single) acctDesc = `Account ${single[1]}`;
+  out.note = [out.reference && `Ref ${out.reference}`, company, acctDesc].filter(Boolean).join(" · ");
+  return out;
+}
+// Normalise a parsed date string to ISO yyyy-mm-dd for the date input.
+function toISODate(s) {
+  if (!s) return "";
+  const mo = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+  let m = String(s).match(/(\d{1,2})(?:st|nd|rd|th)?[\s\/\-.]+([A-Za-z]{3,})[\s\/\-.]+(\d{2,4})/);
+  if (m) { const d = +m[1], mm = mo[m[2].slice(0, 3).toLowerCase()], y = +m[3] < 100 ? 2000 + +m[3] : +m[3]; if (mm) return `${y}-${String(mm).padStart(2, "0")}-${String(d).padStart(2, "0")}`; }
+  m = String(s).match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  if (m) { let d = +m[1], mm = +m[2]; const y = +m[3] < 100 ? 2000 + +m[3] : +m[3]; if (mm > 12) { const tmp = d; d = mm; mm = tmp; } if (mm >= 1 && mm <= 12 && d >= 1 && d <= 31) return `${y}-${String(mm).padStart(2, "0")}-${String(d).padStart(2, "0")}`; }
+  return "";
+}
 async function aiExtract(bill, settings, content) {
   const key = settings.apiKey;
   const model = settings.model || "claude-sonnet-4-6";
@@ -444,6 +525,23 @@ async function aiExtract(bill, settings, content) {
   if (Array.isArray(parsed.extraUsages)) parsed.extraUsages = parsed.extraUsages.map((u) => ({ description: u.description || "", amount: u.amount || 0, category: USAGE_CATS.includes(u.category) ? u.category : "Staff chargeable" }));
   return parsed;
 }
+// Extract each Service ID and its subtotal from the DU "Charges summary by services" table.
+function extractDUServices(text) {
+  const t = (text || "").replace(/\s+/g, " ");
+  const start = t.search(/Charges summary by services/i);
+  if (start < 0) return [];
+  const seg = t.slice(start, start + 4500);
+  const out = []; const seen = new Set();
+  const re = /((?:\d[\d ]{7,}\d)|(?:BUNDLE\s*\d+(?:\s+\d+)*)|(?:[A-Z]{2,}\d{5,}))\s+([A-Za-z][A-Za-z0-9 .\-]{2,40}?)\s+((?:-?[\d,]+\.\d{2}\s+){1,}-?[\d,]+\.\d{2})/gi;
+  let m;
+  while ((m = re.exec(seg))) {
+    const id = m[1].replace(/\s+/g, ""); const plan = m[2].trim();
+    const nums = m[3].trim().split(/\s+/); const subtotal = parseFloat(nums[nums.length - 1].replace(/,/g, ""));
+    if (/^(total|subtotal)/i.test(plan) || /^(total|subtotal)/i.test(id) || seen.has(id)) continue;
+    seen.add(id); out.push({ id, plan, amount: isNaN(subtotal) ? 0 : subtotal });
+  }
+  return out;
+}
 function parseDU(text) {
   const t = (text || "").replace(/\s+/g, " ");
   const amt = (re) => { const m = t.match(re); return m ? parseFloat(m[1].replace(/,/g, "")) : ""; };
@@ -479,6 +577,7 @@ function parseDU(text) {
   out.vat = +(num(out.basicRental) * 5 / 100).toFixed(2);
   out.total = +(num(out.basicRental) + num(out.otherCharges) + num(out.vat)).toFixed(2);
   out.currentCharges = out.total;
+  out.services = extractDUServices(text);   // per-Service-ID breakdown (multi-line DU bills)
   return out;
 }
 // Robust bill-period extractor: finds a real date RANGE (e.g. "01 Jan 2026 - 31 Jan 2026"),
@@ -539,11 +638,11 @@ function extractBillExtras(text, provider) {
     out.billDate = dateNear(["bill date", "bill issue date", "invoice date"]);
     out.vat = near(["vat at 5%", "vat \\(5%\\)", "vat\\(5%\\)", "vat 5%"]);
     // previous pending: "Minimum payment to stay connected" is the cleanest single figure
-    out.previousBalance = near(["minimum payment to stay connected", "total remaining", "previous bill amount", "previous balance"]);
-    // In pdf.js the row prints as: "Total amount due  What you paid  Adjustments   <prev>  <paid>  <adj>".
-    // So "What you paid" is the 2nd value — read it positionally, not by nearest number (which grabs <prev>).
+    // pdf.js prints "Total amount due  What you paid  Adjustments   <prev-gross>  <paid>  <adj>".
+    // previousBalance = the GROSS previous total; paymentReceived = what was paid against it.
     { const pm = t.match(/total amount due\s+what you paid\s+adjustments\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})/i);
-      out.paymentReceived = pm ? Math.abs(toNum(pm[2])) : near(["what you paid", "payment received"]); }
+      if (pm) { out.previousBalance = toNum(pm[1]); out.paymentReceived = Math.abs(toNum(pm[2])); }
+      else { out.previousBalance = near(["previous bill amount", "total amount due", "total remaining", "minimum payment to stay connected"]); out.paymentReceived = near(["what you paid", "payment received"]); } }
     out.currentCharges = near(["this month.?s charges aed"]); // usually computed later as taxable + vat
     out.otherCharges = near(["subtotal of non-taxable services", "non-taxable services"]); // usually 0
   } else {
@@ -959,12 +1058,15 @@ function App({ supabase, session, onLogout }) {
     const KEEP = ["basicRental", "otherCharges", "vat", "total", "previousBalance", "paymentReceived", "currentCharges", "billDate", "dueDate"];
     let changed = false;
     const next = bills.map((b) => {
-      if (!(b.analysed && (b.billVersion || 0) < PARSER_VERSION)) return b;
+      // NEVER re-parse an approved/verified bill — its figures are locked once you approve it,
+      // so parser updates can't change a month you've already verified.
+      if (!(b.analysed && !b.approved && (b.billVersion || 0) < PARSER_VERSION)) return b;
       try {
         if (b.rawText) {
           const patch = heuristicParse(b.rawText, b.provider);
           const merged = { ...b, billVersion: PARSER_VERSION };
           KEEP.forEach((k) => { if (patch[k] !== undefined && patch[k] !== "") merged[k] = patch[k]; });
+          if (patch.services && patch.services.length) merged.services = patch.services;
           changed = true; return merged;
         }
         if (b.provider === "DU" && num(b.basicRental)) {
@@ -1742,11 +1844,15 @@ function BillUpload({ bills, save, flash, connections, settings }) {
 
   const [uploading, setUploading] = useState(false);
   const onFiles = async (files) => {
-    const list = [...files]; const additions = [];
+    const list = [...files]; const additions = []; let dupSkipped = 0;
     setUploading(true);
+    const existing = new Set(bills.filter((b) => b.monthKey === mk).map((b) => (b.fileName || "").toLowerCase()));
     for (const file of list) {
       const okType = file.type === "application/pdf" || file.type.startsWith("image/");
       if (!okType) { flash(`Skipped ${file.name} (only PDF / image)`); continue; }
+      const fnKey = (file.name || "").toLowerCase();
+      if (existing.has(fnKey)) { dupSkipped++; continue; }   // already uploaded this bill to this period
+      existing.add(fnKey);
       const id = uid();
       let storagePath = null;
       try {
@@ -1760,7 +1866,8 @@ function BillUpload({ bills, save, flash, connections, settings }) {
       });
     }
     setUploading(false);
-    if (additions.length) { save([...bills, ...additions]); flash(`${additions.length} file(s) uploaded to ${mkLabel(mk)}`); }
+    if (additions.length) { save([...bills, ...additions]); flash(`${additions.length} file(s) uploaded to ${mkLabel(mk)}${dupSkipped ? ` · ${dupSkipped} duplicate(s) skipped` : ""}`); }
+    else if (dupSkipped) { flash(`${dupSkipped} duplicate(s) skipped — already in ${mkLabel(mk)}`); }
   };
   const removeBill = (id) => { if (confirm("Remove this uploaded bill?")) { save(bills.filter((b) => b.id !== id)); flash("Removed"); } };
   const viewBill = async (b) => { const url = b.storagePath ? await fileSignedUrl(b.storagePath) : b.base64; if (url) window.open(url, "_blank"); else alert("File not available."); };
@@ -1925,6 +2032,8 @@ function ManualBillModal({ connections, settings, onSave, onClose }) {
 }
 function Analysis({ bills, saveBills, connections, settings, flash, addConnection, setTab, notifyUnidentified }) {
   const [open, setOpen] = useState(null);
+  const [expandSvc, setExpandSvc] = useState(new Set());
+  const toggleSvc = (id) => setExpandSvc((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
   const [addConn, setAddConn] = useState(null);
   const [busy, setBusy] = useState(null);
   const cur = settings.currency;
@@ -1958,7 +2067,8 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
         patch.extraUsages = bill.extraUsages || [];
       }
       refineFromFilename(patch, bill.fileName, bill.provider);
-      const merged = { ...patch, rawText: (content.text || "").slice(0, 8000), billVersion: PARSER_VERSION };
+      const scanned = (content.text || "").trim().length < 40 && !num(patch.total);
+      const merged = { ...patch, rawText: (content.text || "").slice(0, 8000), billVersion: PARSER_VERSION, scanned };
       const dmk = periodToMonthKey(patch.invoicePeriod); if (dmk) merged.monthKey = dmk;
       if (review) { updateBill(bill.id, merged); setOpen(bill.id); }
       else { updateBill(bill.id, { ...merged, analysed: true }); }
@@ -1986,7 +2096,7 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
         }
         refineFromFilename(patch, b.fileName, b.provider);
         const dmk = periodToMonthKey(patch.invoicePeriod);
-        patches[b.id] = { ...patch, rawText: (content.text || "").slice(0, 8000), analysed: true, billVersion: 2, ...(dmk ? { monthKey: dmk } : {}) };
+        patches[b.id] = { ...patch, rawText: (content.text || "").slice(0, 8000), analysed: true, billVersion: PARSER_VERSION, scanned: (content.text || "").trim().length < 40 && !num(patch.total), ...(dmk ? { monthKey: dmk } : {}) };
       } catch (e) { console.error("analyse failed", b.fileName, e); }
     }
     setBusy(null);
@@ -2019,6 +2129,26 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
     bills.filter((b) => (provFilter === "all" || b.provider === provFilter) && matchQ(b)).forEach((b) => (m[b.monthKey] = m[b.monthKey] || []).push(b));
     return Object.keys(m).sort().reverse().map((mk) => ({ mk, list: m[mk].slice().sort((x, y) => statusRank(x) - statusRank(y)) }));
   }, [bills, provFilter, connections, q]);
+  // Duplicate bills = same provider + invoice number (regardless of filename). Keep the approved/first
+  // copy as primary; the rest are flagged as duplicates so they can be spotted and removed.
+  const dupIds = useMemo(() => {
+    const groups = {}; const dups = new Set();
+    bills.forEach((b) => { const inv = String(b.invoiceNumber || "").trim().toLowerCase(); if (b.analysed && inv) { const k = (b.provider || "") + "|" + inv; (groups[k] = groups[k] || []).push(b); } });
+    Object.values(groups).forEach((g) => { if (g.length > 1) { const primary = g.find((x) => x.approved) || g[0]; g.forEach((x) => { if (x.id !== primary.id) dups.add(x.id); }); } });
+    return dups;
+  }, [bills]);
+  // Groups of duplicate bills (same provider + invoice), so the user can review & pick which to remove.
+  const dupGroups = useMemo(() => {
+    const groups = {};
+    bills.forEach((b) => { const inv = String(b.invoiceNumber || "").trim().toLowerCase(); if (b.analysed && inv) { const k = (b.provider || "") + "|" + inv; (groups[k] = groups[k] || []).push(b); } });
+    return Object.values(groups).filter((g) => g.length > 1).map((g) => { const primary = g.find((x) => x.approved) || g[0]; return { invoice: g[0].invoiceNumber, provider: g[0].provider, bills: g, primaryId: primary.id }; });
+  }, [bills]);
+  const [dupOpen, setDupOpen] = useState(false);
+  const removeDupSelected = (ids) => {
+    if (!ids.length) { flash("Nothing selected"); return; }
+    const set = new Set(ids); saveBills(bills.filter((b) => !set.has(b.id)));
+    flash(`${ids.length} duplicate bill(s) removed (also from Bill Upload)`); setDupOpen(false);
+  };
 
   const exportRows = (billList, fileName) => {
     const head = ["Month", "Provider", "Account #", "Invoice #", "User", "Company", "Department", "Basic Rental", "Local Calls & SMS", "Staff Charge", "VAT", "Total", "Status"];
@@ -2065,7 +2195,9 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
             <span style={{ background: T.teal + "18", color: T.tealDk }} className="px-2 py-0.5 rounded text-[11px] font-medium">{approvedList.length} approved</span>
             {pendingIdentified.length > 0 && <span style={{ background: T.amber + "20", color: T.amber }} className="px-2 py-0.5 rounded text-[11px] font-medium">{pendingIdentified.length} ready to approve</span>}
             {pendingUnidentified.length > 0 && <span style={{ background: T.amber + "20", color: T.amber }} className="px-2 py-0.5 rounded text-[11px] font-medium">{pendingUnidentified.length} pending (unidentified)</span>}
+            {dupIds.size > 0 && <span style={{ background: T.red + "18", color: T.red }} className="px-2 py-0.5 rounded text-[11px] font-medium">{dupIds.size} duplicate{dupIds.size > 1 ? "s" : ""}</span>}
             <div className="flex-1" />
+            {dupIds.size > 0 && <Btn variant="ghost" onClick={() => setDupOpen(true)}><Trash2 size={15} /> Review duplicates</Btn>}
             {allApproved ? (
               <span className="flex items-center gap-1.5 font-medium text-[13px]" style={{ color: T.tealDk }}><Check size={16} /> All identified costs approved &amp; committed</span>
             ) : (
@@ -2125,19 +2257,31 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
                     const matched = a?.conn;
                     const unmatched = b.analysed && String(b.accountNumber || "").trim() && !matched;
                     const staffFlag = a && num(a.staff) > 0;
+                    const pend = a ? num(a.prevPending) : 0;
+                    const payable = a ? num(a.amountDue) : 0;
+                    const showPay = a && payable > 0 && Math.abs(payable - num(a.total)) > 0.01;
+                    const svcOpen = expandSvc.has(b.id);
+                    const isDup = dupIds.has(b.id);
                     return (
-                      <tr key={b.id} style={{ borderBottom: `1px solid ${T.line}`, background: unmatched ? T.amberSoft : (staffFlag ? "#F6ECFB" : (b.approved ? "#EDF7F3" : "transparent")), borderLeft: staffFlag ? `3px solid #9B5DE5` : "3px solid transparent" }}>
-                        <td className="px-3 py-2.5 max-w-[160px] truncate">{b.fileName}</td>
+                      <React.Fragment key={b.id}>
+                      <tr style={{ borderBottom: svcOpen ? "none" : `1px solid ${T.line}`, background: isDup ? "#FDECEC" : (unmatched ? T.amberSoft : (pend > 0.01 ? "#FFF6E9" : (staffFlag ? "#F6ECFB" : (b.approved ? "#EDF7F3" : "transparent")))), borderLeft: isDup ? `3px solid ${T.red}` : (pend > 0.01 ? `3px solid ${T.amber}` : (staffFlag ? `3px solid #9B5DE5` : "3px solid transparent")) }}>
+                        <td className="px-3 py-2.5 max-w-[180px]">
+                          <div className="truncate">{b.fileName}</div>
+                          {isDup && <span title="Same invoice number as another bill — likely a duplicate. Use 'Remove duplicates' to clear the extra copies." style={{ background: T.red, color: "#fff", padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600, marginRight: 4 }}>duplicate</span>}
+                          {b.scanned && <span title="This PDF is a scanned image with no text — it can't be read automatically. Enter the figures via Edit, or upload a text (non-scanned) copy." style={{ background: T.red, color: "#fff", padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600 }}>scanned · can't read</span>}
+                          {b.services && b.services.length > 1 && <button onClick={() => toggleSvc(b.id)} title="Click to expand / collapse the services on this bill" style={{ background: "#2563EB", color: "#fff", padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600 }}>{svcOpen ? "▾ " : "▸ "}{b.services.length} services</button>}
+                          {pend > 0.01 && <span style={{ background: T.amber, color: "#fff", padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600, marginLeft: 4 }}>pending {money(pend, cur)}</span>}
+                        </td>
                         <td className="px-3 py-2.5"><ProviderTag p={b.provider} /></td>
                         <td className="px-3 py-2.5">{b.accountNumber || <span style={{ color: T.sub }}>—</span>}</td>
                         <td className="px-3 py-2.5">{b.invoiceNumber || <span style={{ color: T.sub }}>—</span>}</td>
                         <td className="px-3 py-2.5 whitespace-nowrap">
                           {billPeriod(b) ? <span style={{ color: T.tealDk, fontWeight: 600 }} className="text-xs">{billPeriod(b)}</span> : <span style={{ color: T.sub }} className="text-xs">{mkLabel(b.monthKey)}</span>}
-                          {(num(b.previousBalance) > 0 || num(b.paymentReceived) > 0) && (
+                          {a && (num(a.previousBalance) > 0 || num(a.paymentReceived) > 0) && (
                             <div className="text-[11px] mt-0.5" style={{ color: T.sub }}>
-                              {num(b.previousBalance) > 0 && <span style={{ color: T.amber }}>prev due {money(num(b.previousBalance), cur)}</span>}
-                              {num(b.previousBalance) > 0 && num(b.paymentReceived) > 0 && " · "}
-                              {num(b.paymentReceived) > 0 && <span style={{ color: T.tealDk }}>rcvd {money(num(b.paymentReceived), cur)}</span>}
+                              {num(a.previousBalance) > 0 && <span style={{ color: T.amber }}>prev total {money(num(a.previousBalance), cur)}</span>}
+                              {num(a.previousBalance) > 0 && num(a.paymentReceived) > 0 && " · "}
+                              {num(a.paymentReceived) > 0 && <span style={{ color: T.tealDk }}>rcvd {money(num(a.paymentReceived), cur)}</span>}
                             </div>
                           )}
                         </td>
@@ -2149,7 +2293,10 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
                           )) : "—"}
                         </td>
                         <td className="px-3 py-2.5">{a ? money(a.vat, cur) : "—"}</td>
-                        <td className="px-3 py-2.5 font-medium">{a ? money(a.total, cur) : "—"}</td>
+                        <td className="px-3 py-2.5 font-medium">
+                          {a ? money(a.total, cur) : "—"}
+                          {showPay && <div className="text-[11px] mt-0.5" style={{ color: T.amber }} title="Amount to pay (includes previous pending)">to pay {money(payable, cur)}</div>}
+                        </td>
                         <td className="px-3 py-2.5">
                           <div className="flex items-center gap-1 justify-end">
                             {b.approved && <span style={{ background: T.teal + "18", color: T.tealDk }} className="px-2 py-0.5 rounded text-[11px] font-medium flex items-center gap-1"><Check size={11} /> Approved</span>}
@@ -2170,6 +2317,22 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
                           </div>
                         </td>
                       </tr>
+                      {svcOpen && b.services && b.services.length > 1 && (
+                        <tr style={{ borderBottom: `1px solid ${T.line}`, background: "#F5F8FF" }}>
+                          <td colSpan={11} className="px-3 pb-3 pt-0">
+                            <div className="rounded-lg overflow-hidden" style={{ border: `1px solid #DCE6FA` }}>
+                              <div className="px-3 py-1.5 text-[11px] font-semibold" style={{ background: "#E8F0FE", color: "#2563EB" }}>{b.services.length} services on this bill · sum {money(b.services.reduce((s, x) => s + num(x.amount), 0), cur)} (taxable)</div>
+                              {b.services.map((s, i) => (
+                                <div key={i} className="flex items-center justify-between px-3 py-1.5 text-[12px]" style={{ borderTop: i ? "1px solid #ECF2FE" : "none" }}>
+                                  <span><b>{s.id}</b>{s.plan ? <span style={{ color: T.sub }}> · {s.plan}</span> : ""}</span>
+                                  <span className="font-medium">{money(num(s.amount), cur)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                     );
                   })}
                 </tbody>
@@ -2193,7 +2356,49 @@ function Analysis({ bills, saveBills, connections, settings, flash, addConnectio
         </Modal>
       )}
       {approveOpen && <ApprovalModal bills={bills} connections={connections} settings={settings} unidentifiedCount={unidentified.size} onConfirm={doApproveAll} onClose={() => setApproveOpen(false)} />}
+      {dupOpen && <DuplicatesModal groups={dupGroups} settings={settings} onRemove={removeDupSelected} onClose={() => setDupOpen(false)} />}
     </React.Fragment>
+  );
+}
+function DuplicatesModal({ groups, settings, onRemove, onClose }) {
+  const cur = settings.currency || "AED";
+  // default selection: every non-primary copy is pre-selected for removal (approved/first is kept)
+  const [sel, setSel] = useState(() => { const s = new Set(); groups.forEach((g) => g.bills.forEach((b) => { if (b.id !== g.primaryId) s.add(b.id); })); return s; });
+  const toggle = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const selApprovedCount = groups.flatMap((g) => g.bills).filter((b) => sel.has(b.id) && b.approved).length;
+  return (
+    <Modal title={`Duplicate bills — ${groups.length} invoice${groups.length > 1 ? "s" : ""} with copies`} onClose={onClose}>
+      <div className="text-[13px] mb-3" style={{ color: T.sub }}>
+        Same invoice number found on more than one file. Tick the copies you want to remove — removing here deletes them from <b>Bill Upload</b> too. The kept copy is marked <b style={{ color: T.tealDk }}>keep</b>.
+      </div>
+      <div className="space-y-3 max-h-[52vh] overflow-y-auto pr-1">
+        {groups.map((g, gi) => (
+          <div key={gi} className="rounded-lg overflow-hidden" style={{ border: `1px solid ${T.line}` }}>
+            <div className="px-3 py-1.5 text-[12px] font-semibold flex items-center gap-2" style={{ background: T.paper }}>
+              <ProviderTag p={g.provider} /> Invoice <span style={{ color: T.blue }}>{g.invoice}</span> · {g.bills.length} copies
+            </div>
+            {g.bills.map((b) => { const isPrimary = b.id === g.primaryId; const checked = sel.has(b.id); return (
+              <label key={b.id} className="flex items-center gap-3 px-3 py-2 text-[13px] cursor-pointer" style={{ borderTop: `1px solid ${T.line}`, background: checked ? "#FDECEC" : "transparent" }}>
+                <input type="checkbox" checked={checked} onChange={() => toggle(b.id)} />
+                <span className="flex-1 truncate" title={b.fileName}>{b.fileName}</span>
+                <span style={{ color: T.sub }}>{b.accountNumber}</span>
+                <span className="font-medium">{money(num(allocate(b, [], settings).total), cur)}</span>
+                {isPrimary ? <span style={{ background: T.teal + "20", color: T.tealDk, padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600 }}>keep</span> : <span style={{ width: 34 }} />}
+                {b.approved && <span style={{ background: T.blue + "18", color: T.blue, padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 600 }}>approved</span>}
+              </label>
+            ); })}
+          </div>
+        ))}
+      </div>
+      {selApprovedCount > 0 && <div className="mt-3 rounded-lg px-3 py-2 text-[12px]" style={{ background: T.amberSoft, color: T.amber, border: `1px solid ${T.amber}44` }}>⚠ {selApprovedCount} approved (verified) bill(s) selected — removing these will change a verified month. Untick them unless you're sure.</div>}
+      <div className="flex items-center justify-between mt-4">
+        <span className="text-[13px]" style={{ color: T.sub }}>{sel.size} selected for removal</span>
+        <div className="flex gap-2">
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+          <Btn variant="danger" onClick={() => onRemove([...sel])} disabled={sel.size === 0}><Trash2 size={15} /> Remove {sel.size} selected</Btn>
+        </div>
+      </div>
+    </Modal>
   );
 }
 function BillEditModal({ bill, connections, settings, onSave, onClose }) {
@@ -2252,7 +2457,7 @@ function BillEditModal({ bill, connections, settings, onSave, onClose }) {
   const total = +(rentalN + otherN + vatN).toFixed(2);
   const currentMonthDue = total;
   // net previous pending: Etisalat prints bill + a matching payment; DU's "minimum payment" is already net
-  const prevPending = isEt ? +Math.max(0, num(f.previousBalance) - num(f.paymentReceived)).toFixed(2) : num(f.previousBalance);
+  const prevPending = +Math.max(0, num(f.previousBalance) - num(f.paymentReceived)).toFixed(2);
   const dueSuggested = +(currentMonthDue + (f.payPrev ? prevPending : 0)).toFixed(2);
   const dueShown = f.amountDue === "" ? (dueSuggested || "") : f.amountDue;
   const autoDue = () => set("amountDue", String(dueSuggested));
@@ -2318,8 +2523,13 @@ function BillEditModal({ bill, connections, settings, onSave, onClose }) {
       </div>
       <div className="mt-5 text-[11px] font-semibold uppercase tracking-wide" style={{ color: T.sub }}>Period &amp; other details <span className="normal-case font-normal">— kept separate, shown in reports, never added to the total above</span></div>
       <div className="grid grid-cols-2 gap-3 mt-1.5">
-        <Field label="Previous balance / pending (due)"><input type="number" value={f.previousBalance} onChange={(e) => set("previousBalance", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
+        <Field label="Previous total (brought forward)"><input type="number" value={f.previousBalance} onChange={(e) => set("previousBalance", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
         <Field label="Payment received (against previous)"><input type="number" value={f.paymentReceived} onChange={(e) => set("paymentReceived", e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
+      </div>
+      <div className="mt-2 rounded-lg px-3 py-2 text-[12px] flex flex-wrap gap-x-4 gap-y-1" style={{ background: prevPending > 0.01 ? T.amberSoft : T.paper, border: `1px solid ${prevPending > 0.01 ? T.amber + "44" : T.line}` }}>
+        <span style={{ color: T.sub }}>Previous total: <b style={{ color: T.text }}>{money(num(f.previousBalance), cur)}</b></span>
+        <span style={{ color: T.sub }}>− Received: <b style={{ color: T.text }}>{money(num(f.paymentReceived), cur)}</b></span>
+        <span style={{ color: prevPending > 0.01 ? T.amber : T.tealDk }}>= <b>Still pending: {money(prevPending, cur)}</b>{prevPending > 0.01 ? " (carries forward)" : " · settled"}</span>
       </div>
       {isEt ? (
         <div className="mt-4">
@@ -2343,7 +2553,18 @@ function BillEditModal({ bill, connections, settings, onSave, onClose }) {
           </div>
         </div>
       ) : (
-        <div style={{ background: T.tealSoft }} className="mt-4 rounded-lg p-3 text-xs">For DU bills only rental, VAT and total are tracked (no usage split).</div>
+        <div style={{ background: T.tealSoft }} className="mt-4 rounded-lg p-3 text-xs">
+          {bill.services && bill.services.length ? (
+            <div>
+              <div className="font-medium mb-1.5" style={{ color: T.tealDk }}>Services on this bill ({bill.services.length}) — sum {money(bill.services.reduce((s, x) => s + num(x.amount), 0), cur)} (taxable)</div>
+              {bill.services.map((s, i) => (
+                <div key={i} className="flex justify-between py-0.5" style={{ borderTop: i ? `1px solid ${T.line}` : "none" }}>
+                  <span><b>{s.id}</b>{s.plan ? ` · ${s.plan}` : ""}</span><span>{money(num(s.amount), cur)}</span>
+                </div>
+              ))}
+            </div>
+          ) : "For DU bills, rental (taxable), non-taxable and VAT are read straight from the bill."}
+        </div>
       )}
       <div className="flex justify-between items-center gap-2 mt-6">
         <label className="flex items-center gap-2 text-[13px] cursor-pointer select-none">
@@ -2444,6 +2665,7 @@ const REPORTS = [
   { id: "comparison", label: "Monthly Comparison" },
   { id: "pending", label: "Pending / Outstanding" },
   { id: "vat", label: "VAT Report" },
+  { id: "coverage", label: "Coverage — missing this month" },
   { id: "summary", label: "User / Account Summary" },
   { id: "staff", label: "Staff Charge Detail" },
   { id: "unidentified", label: "Unidentified Accounts" },
@@ -2457,7 +2679,7 @@ function Reports({ bills, connections, settings }) {
   const years = useMemo(() => { const ys = new Set(bills.map((b) => parseMK(b.monthKey).y)); ys.add(new Date().getFullYear()); return [...ys].sort((a, b) => b - a); }, [bills]);
   const r = useRange();
   const dateRows = analysed.filter((a) => inRange(a.month, r.range.from, r.range.to));
-  const rows = report === "unidentified" ? dateRows : (committedOnly ? dateRows.filter((a) => a.approved && a.conn) : dateRows);
+  const rows = (report === "unidentified" || report === "coverage") ? dateRows : (committedOnly ? dateRows.filter((a) => a.approved && a.conn) : dateRows);
   const data = useMemo(() => buildReport(report, { rows, connections, settings, range: r.range, compBy }), [report, rows, connections, settings, r.range, compBy]);
 
   const exportExcel = () => {
@@ -2466,10 +2688,19 @@ function Reports({ bills, connections, settings }) {
     XLSX.writeFile(wb, `${data.title.replace(/\s+/g, "_")}_${r.range.from}_${r.range.to}.xlsx`);
   };
   const exportPDF = () => printReport(data, settings, r.range);
+  const emailMissing = () => {
+    const to = settings.alertEmail || "";
+    const lines = (data.sheets?.[0]?.body || []).filter((row) => row[0]).map((row) => `${row[0]}. ${row[1]} — ${row[2]} · ${row[3]} (${row[5] || ""})`).join("\n");
+    const subj = `Missing telecom bills — ${mkLabel(r.range.from)}${r.range.from !== r.range.to ? " to " + mkLabel(r.range.to) : ""}`;
+    const bodyTxt = `${data.note || ""}\n\nThese active connections have NO bill for this period (unpaid or invoice not received):\n\n${lines || "None — all covered."}\n\n— Telecom Ledger`;
+    if (!to) { flash("Set the alerts email (Sujith) in Settings first"); return; }
+    window.location.href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subj)}&body=${encodeURIComponent(bodyTxt)}`;
+  };
 
   return (
     <React.Fragment>
       <PageHeader title="Reports" subtitle="Finance, packages, comparisons and staff charges — Excel &amp; PDF">
+        {report === "coverage" && <Btn variant="ghost" onClick={emailMissing}><Mail size={15} /> Email missing {settings.alertEmail ? "to Sujith" : "(set email)"}</Btn>}
         <Btn variant="ghost" onClick={exportPDF}><FileText size={15} /> Save as PDF</Btn>
         <Btn onClick={exportExcel}><FileSpreadsheet size={15} /> Export Excel</Btn>
       </PageHeader>
@@ -2505,6 +2736,11 @@ function Reports({ bills, connections, settings }) {
             </div>
           );
         })()}
+        {data.note && (
+          <div className="rounded-lg px-4 py-3 text-sm font-medium" style={{ background: report === "coverage" ? T.amberSoft : T.tealSoft, color: report === "coverage" ? T.amber : T.tealDk, border: `1px solid ${(report === "coverage" ? T.amber : T.teal)}44` }}>
+            {report === "coverage" ? "📋 " : ""}{data.note}
+          </div>
+        )}
         {data.sheets.map((s, si) => (
           <Card key={si} className="overflow-hidden">
             <div className="px-5 py-3 font-medium" style={{ borderBottom: `1px solid ${T.line}`, background: T.paper }}>{s.name}</div>
@@ -2580,6 +2816,28 @@ function buildReport(type, ctx) {
       return [c.sn, c.accountNumber, c.userName, c.company, c.department, c.provider, M(t.base), elig || "—", M(t.sub), M(t.vat), M(t.total), c.initiatedDate || "—", c.status === "cancelled" ? "Cancelled" : "Active"];
     });
     return { title: "Basic Package Detail", sheets: [{ name: "Package Detail", head, body }] };
+  }
+  if (type === "coverage") {
+    // Which ACTIVE connections have no bill in the selected period → missing invoice / not paid
+    const active = (connections || []).filter((c) => (c.status || "active") === "active" && normAcc(c.accountNumber));
+    const billed = new Set(rows.map((a) => normAcc(a.accountNumber)).filter(Boolean));
+    const missing = active.filter((c) => !billed.has(normAcc(c.accountNumber)));
+    const covered = active.length - missing.length;
+    const head = ["S/N", "Account #", "User", "Company", "Department", "Provider", "Status"];
+    const body = missing.map((c, i) => [i + 1, c.accountNumber, c.userName || "—", c.company || "—", c.department || "—", c.provider || "—", "NO BILL THIS PERIOD"]);
+    if (!body.length) body.push(["", "", "", "", "", "", "✓ All active connections have a bill this period"]);
+    // summary sheet
+    const byCo = {}; missing.forEach((c) => (byCo[c.company || "—"] = (byCo[c.company || "—"] || 0) + 1));
+    const sumHead = ["Company", "Missing bills"];
+    const sumBody = Object.entries(byCo).sort((a, b) => b[1] - a[1]).map(([c, n]) => [c, n]);
+    const st = ["TOTAL MISSING", missing.length]; st._total = true; sumBody.push(st);
+    const cov = ["", ""]; // spacer
+    sumBody.unshift(["Active connections", active.length]);
+    sumBody.unshift(["Covered (have a bill)", covered]);
+    return { title: "Coverage — missing this month", note: `${covered} of ${active.length} active connections covered · ${missing.length} missing`, sheets: [
+      { name: "Missing bills", head, body },
+      { name: "Summary", head: sumHead, body: sumBody },
+    ] };
   }
   if (type === "pending") {
     // outstanding = previous pending carried into the bill, plus anything not yet approved/committed
@@ -2766,6 +3024,7 @@ function SettingsModal({ settings, onSave, onClose, onExport, onRestore, stats }
         <Field label="Organisation name"><input value={f.orgName} onChange={(e) => set("orgName", e.target.value)} style={inputStyle} className={inputCls} /></Field>
         <Field label="Currency"><input value={f.currency} onChange={(e) => set("currency", e.target.value)} style={inputStyle} className={inputCls} /></Field>
         <Field label="Default VAT %"><input type="number" value={f.vatRate} onChange={(e) => set("vatRate", +e.target.value)} style={inputStyle} className={inputCls} /></Field>
+        <Field label="Alerts email (e.g. Sujith)"><input type="email" value={f.alertEmail || ""} onChange={(e) => set("alertEmail", e.target.value)} style={inputStyle} className={inputCls} placeholder="sujith@example.com — for missing-bill alerts" autoComplete="off" /></Field>
         <div style={{ borderTop: `1px solid ${T.line}` }} className="pt-4">
           <div className="font-medium text-[13px] mb-1">AI bill analysis (optional)</div>
           <p style={{ color: T.sub }} className="text-[11px] mb-3">Add your own Anthropic API key to auto-read uploaded bills accurately. Without a key, the app still reads PDF/image text and auto-fills what it can. The key is stored only in this browser and sent only to Anthropic's API — never enter it on a shared computer.</p>
@@ -2813,16 +3072,35 @@ function Payments({ bills, receipts, saveReceipts, connections, settings, flash 
   const [refNo, setRefNo] = useState("");
   const [payDate, setPayDate] = useState("");
   const fileRef = useRef();
+  const [reading, setReading] = useState(false);
   const cur = settings.currency || "AED";
+  // Read the chosen receipt file and auto-fill amount/date/reference. Never touches bills or verified data.
+  const onReceiptFile = async () => {
+    const file = fileRef.current && fileRef.current.files && fileRef.current.files[0];
+    if (!file || !(file.type === "application/pdf" || file.type.startsWith("image/"))) return;
+    setReading(true);
+    try {
+      const text = await readFileText(file);   // includes OCR fallback for scanned/image receipts
+      const r = parseReceipt(text);
+      if (r.amount) setAmount(String(r.amount));
+      if (r.date) setPayDate(/^\d{4}-\d{2}-\d{2}$/.test(r.date) ? r.date : (toISODate(r.date) || ""));
+      if (r.note) setRefNo(r.note); else if (r.reference) setRefNo(r.reference);
+      flash(r.amount ? `Read receipt — ${money(num(r.amount), cur)}${r.date ? " · " + r.date : ""}${r.reference ? " · " + r.reference : ""}` : "Couldn't read this receipt automatically — please type the amount");
+    } catch (e) { console.error(e); flash("Couldn't read the receipt — enter details manually"); }
+    setReading(false);
+  };
   const mk = monthKey(year, month);
   const years = [];
   for (let y = now.getFullYear() + 1; y >= now.getFullYear() - 6; y--) years.push(y);
 
   const invoicedFor = (mkey, prov) => bills.filter((b) => b.monthKey === mkey && b.analysed && (!prov || b.provider === prov)).reduce((s, b) => s + (allocate(b, connections, settings).total || 0), 0);
+  // Previous pending brought forward on this month's bills (last month unpaid, shown on the current bill)
+  const pendingFor = (mkey, prov) => bills.filter((b) => b.monthKey === mkey && b.analysed && (!prov || b.provider === prov)).reduce((s, b) => s + (allocate(b, connections, settings).prevPending || 0), 0);
   const paidFor = (mkey, prov) => receipts.filter((r) => r.monthKey === mkey && (!prov || r.provider === prov)).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
 
   const monthReceipts = receipts.filter((r) => r.monthKey === mk).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  const inv = invoicedFor(mk), paid = paidFor(mk), diff = +(inv - paid).toFixed(2);
+  // Owed = this month's invoiced + previous pending brought forward. Paid is reconciled against Owed.
+  const inv = invoicedFor(mk), pend = pendingFor(mk), owed = +(inv + pend).toFixed(2), paid = paidFor(mk), diff = +(owed - paid).toFixed(2);
   const diffColor = Math.abs(diff) < 0.01 ? T.green : diff > 0 ? T.red : "#2E6DB4";
   const diffLabel = Math.abs(diff) < 0.01 ? "Fully settled" : diff > 0 ? "Outstanding (to pay)" : "Overpaid";
 
@@ -2848,13 +3126,47 @@ function Payments({ bills, receipts, saveReceipts, connections, settings, flash 
   const removeReceipt = (id) => { if (confirm("Remove this receipt?")) { saveReceipts(receipts.filter((r) => r.id !== id)); flash("Removed"); } };
   const viewReceipt = async (r) => { const url = r.storagePath ? await fileSignedUrl(r.storagePath) : r.base64; if (url) window.open(url, "_blank"); else alert("No file stored."); };
 
+  const bulkRef = useRef();
+  const [bulkBusy, setBulkBusy] = useState(null);
+  // Upload MANY receipts at once: each file is read (OCR if scanned), provider/month/amount/date/note
+  // are auto-detected, and one receipt is added per file. Existing bills & verified data are untouched.
+  const bulkAdd = async () => {
+    const files = bulkRef.current && bulkRef.current.files ? [...bulkRef.current.files] : [];
+    if (!files.length) { flash("Choose one or more receipt files"); return; }
+    const existingRefs = new Set(receipts.map((r) => (r.reference || "").toLowerCase()).filter(Boolean));
+    const newRecs = []; let failed = 0, dup = 0;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]; setBulkBusy(`Reading ${i + 1} / ${files.length}…`);
+      if (!(file.type === "application/pdf" || file.type.startsWith("image/"))) { failed++; continue; }
+      try {
+        const text = await readFileText(file);
+        const r = parseReceipt(text);
+        if (!r.amount) { failed++; continue; }
+        const refLow = (r.reference || "").toLowerCase();
+        if (refLow && (existingRefs.has(refLow) || newRecs.some((x) => (x.reference || "").toLowerCase().split(" · ")[0].replace("ref ", "") === refLow))) { dup++; continue; }
+        const low = (text || "").toLowerCase();
+        const prov = (r.reference || "").toUpperCase().startsWith("B2B") || low.includes("etisalat") ? "Etisalat" : (low.includes("du business") || low.includes("du app") || low.includes("du.ae") ? "DU" : provider);
+        // Receipts belong to the SELECTED month (you select the bill month; its bills are paid the next
+        // month, so the receipt's own date may be later — we keep that date but file it under the month you chose).
+        const recMk = mk;
+        const id = uid(); let storagePath = null;
+        try { const dataUrl = await new Promise((res) => { const rd = new FileReader(); rd.onload = () => res(rd.result); rd.readAsDataURL(file); }); storagePath = await uploadToStorage(id, dataUrl, file.type); } catch (e) { /* keep receipt even if file store fails */ }
+        newRecs.push({ id, monthKey: recMk, provider: prov, amount: num(r.amount), reference: r.note || r.reference || "", payDate: r.date || null, fileName: file.name, fileType: file.type, size: file.size, storagePath, createdAt: Date.now() + i });
+        if (refLow) existingRefs.add(refLow);
+      } catch (e) { console.error(e); failed++; }
+    }
+    if (newRecs.length) saveReceipts([...receipts, ...newRecs]);
+    setBulkBusy(null); if (bulkRef.current) bulkRef.current.value = "";
+    flash(`${newRecs.length} receipt(s) added${dup ? ` · ${dup} duplicate(s) skipped` : ""}${failed ? ` · ${failed} couldn't be read` : ""}`);
+  };
+
   const allMonths = useMemo(() => { const set = new Set([...bills.map((b) => b.monthKey), ...receipts.map((r) => r.monthKey)].filter(Boolean)); return Array.from(set).sort().reverse(); }, [bills, receipts]);
 
   const exportOverview = () => {
-    const head = ["Month", `Invoiced (${cur})`, `Paid (${cur})`, `Difference (${cur})`, "Status"];
-    const body = allMonths.map((m) => { const i = invoicedFor(m), p = paidFor(m), d = +(i - p).toFixed(2); return [mkLabel(m), i.toFixed(2), p.toFixed(2), d.toFixed(2), Math.abs(d) < 0.01 ? "Settled" : d > 0 ? "Outstanding" : "Overpaid"]; });
-    const ti = allMonths.reduce((s, m) => s + invoicedFor(m), 0), tp = allMonths.reduce((s, m) => s + paidFor(m), 0);
-    body.push(["TOTAL", ti.toFixed(2), tp.toFixed(2), (ti - tp).toFixed(2), ""]);
+    const head = ["Month", `This month invoiced (${cur})`, `Previous pending (${cur})`, `Total owed (${cur})`, `Paid (${cur})`, `Difference (${cur})`, "Status"];
+    const body = allMonths.map((m) => { const i = invoicedFor(m), pp = pendingFor(m), ow = +(i + pp).toFixed(2), p = paidFor(m), d = +(ow - p).toFixed(2); return [mkLabel(m), i.toFixed(2), pp.toFixed(2), ow.toFixed(2), p.toFixed(2), d.toFixed(2), Math.abs(d) < 0.01 ? "Settled" : d > 0 ? "Outstanding" : "Overpaid"]; });
+    const ti = allMonths.reduce((s, m) => s + invoicedFor(m), 0), tpp = allMonths.reduce((s, m) => s + pendingFor(m), 0), tp = allMonths.reduce((s, m) => s + paidFor(m), 0);
+    body.push(["TOTAL", ti.toFixed(2), tpp.toFixed(2), (ti + tpp).toFixed(2), tp.toFixed(2), (ti + tpp - tp).toFixed(2), ""]);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([head, ...body]), "Reconciliation");
     XLSX.writeFile(wb, "payments-reconciliation.xlsx");
@@ -2881,7 +3193,9 @@ function Payments({ bills, receipts, saveReceipts, connections, settings, flash 
             <div style={{ color: T.sub }} className="text-xs pb-2">Reconciling <b>{mkLabel(mk)}</b></div>
           </div>
           <div className="flex flex-wrap gap-3 mt-4">
-            <KPI label="Total invoiced (analysed bills)" value={inv} />
+            <KPI label="This month invoiced" value={inv} />
+            {pend > 0.001 && <KPI label="Previous pending (b/f)" value={pend} color={T.amber} />}
+            <KPI label={pend > 0.001 ? "Total owed (incl. previous)" : "Total owed"} value={owed} />
             <KPI label="Total paid (receipts)" value={paid} color={T.tealDk} />
             <div style={{ background: diffColor + "12", border: `1px solid ${diffColor}40` }} className="rounded-xl p-4 flex-1 min-w-[150px]">
               <div style={{ color: diffColor }} className="text-xs font-medium">{diffLabel}</div>
@@ -2889,10 +3203,12 @@ function Payments({ bills, receipts, saveReceipts, connections, settings, flash 
             </div>
           </div>
           <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {["Etisalat", "DU"].map((pv) => { const i = invoicedFor(mk, pv), p = paidFor(mk, pv), d = +(i - p).toFixed(2); return (
+            {["Etisalat", "DU"].map((pv) => { const i = invoicedFor(mk, pv), pp = pendingFor(mk, pv), p = paidFor(mk, pv), ow = +(i + pp).toFixed(2), d = +(ow - p).toFixed(2); return (
               <div key={pv} style={{ border: `1px solid ${T.line}` }} className="rounded-lg p-3 text-[13px]">
                 <div className="flex items-center gap-2 mb-1"><ProviderTag p={pv} /></div>
-                <div className="flex justify-between"><span style={{ color: T.sub }}>Invoiced</span><span>{money(i, cur)}</span></div>
+                <div className="flex justify-between"><span style={{ color: T.sub }}>This month invoiced</span><span>{money(i, cur)}</span></div>
+                {pp > 0.001 && <div className="flex justify-between"><span style={{ color: T.sub }}>+ Previous pending</span><span style={{ color: T.amber }}>{money(pp, cur)}</span></div>}
+                <div className="flex justify-between"><span style={{ color: T.sub }}>Total owed</span><span>{money(ow, cur)}</span></div>
                 <div className="flex justify-between"><span style={{ color: T.sub }}>Paid</span><span>{money(p, cur)}</span></div>
                 <div className="flex justify-between font-medium"><span>Difference</span><span style={{ color: Math.abs(d) < 0.01 ? T.green : d > 0 ? T.red : "#2E6DB4" }}>{money(d, cur)}</span></div>
               </div>
@@ -2908,8 +3224,16 @@ function Payments({ bills, receipts, saveReceipts, connections, settings, flash 
             <Field label={`Amount paid (${cur})`}><input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} style={inputStyle} className={inputCls} placeholder="0.00" /></Field>
             <Field label="Payment date"><input type="date" value={payDate} onChange={(e) => setPayDate(e.target.value)} style={inputStyle} className={inputCls} /></Field>
             <Field label="Reference / note"><input value={refNo} onChange={(e) => setRefNo(e.target.value)} style={inputStyle} className={inputCls} placeholder="e.g. bank ref, cheque #" /></Field>
-            <Field label="Receipt file (optional)"><input ref={fileRef} type="file" accept="application/pdf,image/*" className="text-xs" /></Field>
+            <Field label="Receipt file (optional — auto-reads amount &amp; date)"><input ref={fileRef} type="file" accept="application/pdf,image/*" onChange={onReceiptFile} className="text-xs" />{reading && <span className="text-[11px] ml-1" style={{ color: T.blue }}>reading… (scanned files use OCR — may take a few seconds)</span>}</Field>
             <div className="pb-1"><Btn onClick={addReceipt}><Upload size={14} /> Add receipt</Btn></div>
+          </div>
+          <div className="mt-4 pt-4 rounded-lg px-4 py-3" style={{ borderTop: `1px dashed ${T.line}`, background: T.paper }}>
+            <div className="font-medium text-[13px] mb-1">Bulk upload receipts</div>
+            <div className="text-[12px] mb-2" style={{ color: T.sub }}>Choose many receipt files at once — each is read (OCR for scanned files) and added under <b>{mkLabel(mk)}</b> (the month selected above), since a month's bills are paid the next month. The receipt's own date is kept for reference. Duplicates (same reference) are skipped. Bills and verified amounts are never changed.</div>
+            <div className="flex flex-wrap items-center gap-3">
+              <input ref={bulkRef} type="file" multiple accept="application/pdf,image/*" className="text-xs" />
+              <Btn onClick={bulkAdd} disabled={!!bulkBusy}>{bulkBusy ? <React.Fragment><Loader2 size={14} className="animate-spin" /> {bulkBusy}</React.Fragment> : <React.Fragment><Upload size={14} /> Read &amp; add all</React.Fragment>}</Btn>
+            </div>
           </div>
         </Card>
 
